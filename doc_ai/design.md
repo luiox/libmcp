@@ -31,6 +31,13 @@ Origin allowlist 通过 libca_http pre-routing middleware 执行，并只匹配�
 libmcp 策略影响。middleware 在完整 request 读取后运行，body 资源消耗仍由 server 的
 `HttpLimits` 约束。
 
+可选 `HttpRequestAuthorizer` 在 Origin 通过后、解析 JSON 或查询 session 前对 POST/GET/DELETE
+执行应用策略。libmcp 不解析 Bearer、JWT 或 OAuth metadata；回调可返回带
+`WWW-Authenticate` 的自定义拒绝响应，或返回非空稳定 identity。identity 会传给
+`HttpSessionFactory`，并存入 session record；后续请求每次重新认证且必须得到同一 identity，
+不匹配时按 session 不存在返回 404，避免泄露其它主体的 session。session id 只承担路由关联，
+不能替代认证凭据。
+
 每次 initialize 通过 `HttpSessionFactory` 创建独立 `ServerSession`，安全随机 session id 只在
 initialize 成功后发给 client。全局 map mutex 只保护 session 目录和容量预留，不在持锁时调用
 factory；每个 session 的独立 mutex 保证来自多个 HTTP connection 的 message 串行进入非线程安全的

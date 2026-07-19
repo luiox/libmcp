@@ -41,11 +41,13 @@
 - 对同一 session 串行执行 message，不同 session 可由 libca HTTP worker 并发处理。
 - 对 MCP endpoint 的全部 method 在 route 前精确校验 Origin allowlist，再校验 JSON Content-Type
   与 JSON/SSE Accept 声明，并限制 session 总数。
+- 可选 authorizer 为 POST/GET/DELETE 返回自定义拒绝响应或稳定主体 identity；identity 会传给
+  session factory 并绑定 session，阻止其它主体复用 session id。
 - DELETE 终止 session；GET 返回 405，明确当前未开放独立 SSE stream。
 
 ## 尚未实现
 
 - resource/prompt registry 与 dispatcher。
 - Streamable HTTP SSE、resumability 与 session expiry。
-- HTTP authorization hook、HTTPS 与 proxy-aware public origin policy。
+- HTTPS 与 proxy-aware public origin policy。
 - client capability 的持久化与 server-initiated request。

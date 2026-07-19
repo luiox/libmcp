@@ -177,6 +177,42 @@ bool valid_endpoint(const std::string& endpoint) noexcept
 
 }   // namespace
 
+HttpAuthorizationDecision::HttpAuthorizationDecision(std::string identity)
+    : authorized_(true)
+    , identity_(std::move(identity))
+{}
+
+HttpAuthorizationDecision::HttpAuthorizationDecision(ca::http::HttpServerResponse response)
+    : rejection_(std::move(response))
+{}
+
+HttpAuthorizationDecision HttpAuthorizationDecision::authorized(std::string identity)
+{
+    return HttpAuthorizationDecision(std::move(identity));
+}
+
+HttpAuthorizationDecision HttpAuthorizationDecision::rejected(ca::http::HttpServerResponse response)
+{
+    return HttpAuthorizationDecision(std::move(response));
+}
+
+bool HttpAuthorizationDecision::is_authorized() const noexcept
+{
+    return authorized_;
+}
+
+const std::string& HttpAuthorizationDecision::identity() const noexcept
+{
+    return identity_;
+}
+
+ca::http::HttpServerResponse HttpAuthorizationDecision::take_rejection()
+{
+    auto response = std::move(rejection_.value());
+    rejection_.reset();
+    return response;
+}
+
 class StreamableHttpServer::Impl
 {
 public:
@@ -188,6 +224,12 @@ public:
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_post(
         const ca::http::HttpServerRequestContext& context)
     {
+        std::string authorization_identity;
+        auto        authorization = authorize_request(context, authorization_identity);
+        if (authorization.is_err()) return ca::core::Err(std::move(authorization).unwrap_err());
+        auto rejection = std::move(authorization).unwrap();
+        if (rejection.has_value()) return ca::core::Ok(std::move(*rejection));
+
         const auto& request = context.request();
         if (!is_json_content_type(request.headers))
             return text_response(415, "Content-Type must be application/json\n");
@@ -211,7 +253,7 @@ public:
         const bool initialize = message.kind() == JsonRpcMessageKind::Request &&
                                 message.method().has_value() && *message.method() == "initialize";
         if (!session_id.has_value() && !repeated_session && initialize)
-            return initialize_session(message);
+            return initialize_session(message, context, std::move(authorization_identity));
         if (repeated_session) return text_response(400, "MCP-Session-Id must occur exactly once\n");
         if (!session_id.has_value() || session_id->empty())
             return text_response(400, "MCP-Session-Id is required\n");
@@ -220,7 +262,8 @@ public:
         if (record == nullptr) return text_response(404, "MCP session not found\n");
 
         std::unique_lock<std::mutex> lock(record->mutex);
-        if (!record->active) return text_response(404, "MCP session not found\n");
+        if (!record->active || record->authorization_identity != authorization_identity)
+            return text_response(404, "MCP session not found\n");
         auto version_error = validate_protocol_version(request.headers, record->session);
         if (version_error.has_value()) return text_response(400, *version_error);
 
@@ -237,8 +280,14 @@ public:
     }
 
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_get(
-        const ca::http::HttpServerRequestContext&)
+        const ca::http::HttpServerRequestContext& context)
     {
+        std::string authorization_identity;
+        auto        authorization = authorize_request(context, authorization_identity);
+        if (authorization.is_err()) return ca::core::Err(std::move(authorization).unwrap_err());
+        auto rejection = std::move(authorization).unwrap();
+        if (rejection.has_value()) return ca::core::Ok(std::move(*rejection));
+
         ca::http::HttpResponse response;
         response.status   = 405;
         auto content_type = response.headers.append("Content-Type", "text/plain; charset=utf-8");
@@ -254,6 +303,12 @@ public:
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_delete(
         const ca::http::HttpServerRequestContext& context)
     {
+        std::string authorization_identity;
+        auto        authorization = authorize_request(context, authorization_identity);
+        if (authorization.is_err()) return ca::core::Err(std::move(authorization).unwrap_err());
+        auto rejection = std::move(authorization).unwrap();
+        if (rejection.has_value()) return ca::core::Ok(std::move(*rejection));
+
         const auto& request          = context.request();
         bool        repeated_session = false;
         auto        session_id = single_header(request.headers, SESSION_HEADER, repeated_session);
@@ -265,7 +320,8 @@ public:
         if (record == nullptr) return text_response(404, "MCP session not found\n");
         {
             std::lock_guard<std::mutex> lock(record->mutex);
-            if (!record->active) return text_response(404, "MCP session not found\n");
+            if (!record->active || record->authorization_identity != authorization_identity)
+                return text_response(404, "MCP session not found\n");
             auto version_error = validate_protocol_version(request.headers, record->session);
             if (version_error.has_value()) return text_response(400, *version_error);
             record->active = false;
@@ -298,14 +354,37 @@ public:
 private:
     struct SessionRecord
     {
-        explicit SessionRecord(ServerSession value)
+        SessionRecord(ServerSession value, std::string identity)
             : session(std::move(value))
+            , authorization_identity(std::move(identity))
         {}
 
         std::mutex    mutex;
         ServerSession session;
+        std::string   authorization_identity;
         bool          active{true};
     };
+
+    ca::http::HttpResult<std::optional<ca::http::HttpServerResponse>> authorize_request(
+        const ca::http::HttpServerRequestContext& context, std::string& identity)
+    {
+        identity.clear();
+        if (!options_.authorizer)
+            return ca::core::Ok(std::optional<ca::http::HttpServerResponse>{});
+
+        auto authorized = invoke_authorizer(context);
+        if (authorized.is_err()) return ca::core::Err(std::move(authorized).unwrap_err());
+        auto decision = std::move(authorized).unwrap();
+        if (!decision.is_authorized())
+            return ca::core::Ok(
+                std::optional<ca::http::HttpServerResponse>(decision.take_rejection()));
+        if (decision.identity().empty())
+            return ca::core::Err(
+                ca::http::HttpError::from_kind(ca::http::HttpErrorKind::InvalidState,
+                                               "MCP HTTP authorizer returned an empty identity"));
+        identity = decision.identity();
+        return ca::core::Ok(std::optional<ca::http::HttpServerResponse>{});
+    }
 
     bool origin_allowed(const ca::http::HttpHeaders& headers) const
     {
@@ -368,11 +447,13 @@ private:
     }
 
     ca::http::HttpResult<ca::http::HttpServerResponse> initialize_session(
-        const JsonRpcMessage& message)
+        const JsonRpcMessage& message, const ca::http::HttpServerRequestContext& context,
+        std::string authorization_identity)
     {
         if (!reserve_session()) return text_response(503, "MCP session capacity reached\n");
 
-        auto created = create_session();
+        const HttpSessionContext session_context{context, authorization_identity};
+        auto                     created = create_session(session_context);
         if (created.is_err()) {
             release_reservation();
             return text_response(500, "MCP session factory failed\n");
@@ -393,7 +474,8 @@ private:
             return json_response(200, *response);
         }
 
-        auto record = std::make_shared<SessionRecord>(std::move(session));
+        auto record =
+            std::make_shared<SessionRecord>(std::move(session), std::move(authorization_identity));
         for (ca::usize attempt = 0; attempt < SESSION_ID_ATTEMPTS; ++attempt) {
             auto random = ca::crypto::secure_random_bytes(options_.session_id_bytes);
             if (random.is_err()) {
@@ -421,10 +503,10 @@ private:
         return text_response(500, "MCP session id collision\n");
     }
 
-    McpResult<ServerSession> create_session()
+    McpResult<ServerSession> create_session(const HttpSessionContext& context)
     {
         try {
-            return factory_();
+            return factory_(context);
         }
         catch (const std::exception& error) {
             return ca::core::Err(McpError::from_kind(
@@ -435,6 +517,24 @@ private:
             return ca::core::Err(
                 McpError::from_kind(McpErrorKind::InvalidState,
                                     "MCP HTTP session factory threw a non-standard exception"));
+        }
+    }
+
+    ca::http::HttpResult<HttpAuthorizationDecision> invoke_authorizer(
+        const ca::http::HttpServerRequestContext& context)
+    {
+        try {
+            return options_.authorizer(context);
+        }
+        catch (const std::exception& error) {
+            return ca::core::Err(ca::http::HttpError::from_kind(
+                ca::http::HttpErrorKind::InvalidState,
+                std::string("MCP HTTP authorizer threw an exception: ") + error.what()));
+        }
+        catch (...) {
+            return ca::core::Err(ca::http::HttpError::from_kind(
+                ca::http::HttpErrorKind::InvalidState,
+                "MCP HTTP authorizer threw a non-standard exception"));
         }
     }
 

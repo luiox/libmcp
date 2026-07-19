@@ -4,6 +4,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -117,6 +118,11 @@ McpResult<ServerSession> make_session()
     return ServerSession::create(std::move(options));
 }
 
+HttpSessionFactory make_session_factory()
+{
+    return [](const HttpSessionContext&) { return make_session(); };
+}
+
 ca::core::Bytes body_bytes(std::string_view body)
 {
     return ca::core::Bytes::copy_from_slice(reinterpret_cast<const ca::u8*>(body.data()),
@@ -142,6 +148,13 @@ ca::http::HttpRequest post_request(std::string_view                body,
     if (protocol_version.has_value())
         EXPECT_TRUE(
             request.headers.append("MCP-Protocol-Version", std::string(*protocol_version)).is_ok());
+    return request;
+}
+
+ca::http::HttpRequest with_authorization(ca::http::HttpRequest request,
+                                         std::string_view      authorization)
+{
+    EXPECT_TRUE(request.headers.append("Authorization", std::string(authorization)).is_ok());
     return request;
 }
 
@@ -187,7 +200,7 @@ ca::i64 json_rpc_error_code(const ca::http::HttpResponse& response)
 
 TEST(StreamableHttpServerTest, InitializesSessionAndHandlesBufferedMessages)
 {
-    auto server = TestServer::start(make_session);
+    auto server = TestServer::start(make_session_factory());
     ASSERT_NE(server, nullptr);
     auto client = make_client();
 
@@ -234,7 +247,7 @@ TEST(StreamableHttpServerTest, ValidatesContentNegotiationAndOrigin)
 {
     StreamableHttpServerOptions options;
     options.allowed_origins = {"https://allowed.example"};
-    auto server             = TestServer::start(make_session, std::move(options));
+    auto server             = TestServer::start(make_session_factory(), std::move(options));
     ASSERT_NE(server, nullptr);
     auto client = make_client();
 
@@ -275,7 +288,7 @@ TEST(StreamableHttpServerTest, ValidatesContentNegotiationAndOrigin)
 
 TEST(StreamableHttpServerTest, ValidatesSessionAndProtocolHeaders)
 {
-    auto server = TestServer::start(make_session);
+    auto server = TestServer::start(make_session_factory());
     ASSERT_NE(server, nullptr);
     auto client = make_client();
 
@@ -309,7 +322,7 @@ TEST(StreamableHttpServerTest, CanUseNegotiatedVersionWhenHeaderRequirementIsDis
 {
     StreamableHttpServerOptions options;
     options.require_protocol_version_header = false;
-    auto server                             = TestServer::start(make_session, std::move(options));
+    auto server = TestServer::start(make_session_factory(), std::move(options));
     ASSERT_NE(server, nullptr);
     auto       client = make_client();
     const auto session_id =
@@ -323,7 +336,7 @@ TEST(StreamableHttpServerTest, CanUseNegotiatedVersionWhenHeaderRequirementIsDis
 
 TEST(StreamableHttpServerTest, DeletesSessionAndRejectsDeletedId)
 {
-    auto server = TestServer::start(make_session);
+    auto server = TestServer::start(make_session_factory());
     ASSERT_NE(server, nullptr);
     auto       client = make_client();
     const auto session_id =
@@ -360,7 +373,7 @@ TEST(StreamableHttpServerTest, ChecksOriginBeforeRoutingAndOnlyForMcpEndpoint)
 {
     StreamableHttpServerOptions options;
     options.allowed_origins = {"https://allowed.example"};
-    auto server             = TestServer::start(make_session, std::move(options));
+    auto server             = TestServer::start(make_session_factory(), std::move(options));
     ASSERT_NE(server, nullptr);
     auto client = make_client();
 
@@ -386,9 +399,98 @@ TEST(StreamableHttpServerTest, ChecksOriginBeforeRoutingAndOnlyForMcpEndpoint)
     EXPECT_EQ(send(client, server->url("/missing"), std::move(unrelated)).status, 404);
 }
 
+TEST(StreamableHttpServerTest, AuthorizesRequestsAndBindsIdentityToSession)
+{
+    StreamableHttpServerOptions options;
+    options.authorizer = [](const ca::http::HttpServerRequestContext& context)
+        -> ca::http::HttpResult<HttpAuthorizationDecision> {
+        const auto values = context.request().headers.get_all("Authorization");
+        if (values.size() == 1 && values.front() == "Bearer alice")
+            return ca::core::Ok(HttpAuthorizationDecision::authorized("alice"));
+        if (values.size() == 1 && values.front() == "Bearer bob")
+            return ca::core::Ok(HttpAuthorizationDecision::authorized("bob"));
+        if (values.size() == 1 && values.front() == "Bearer empty")
+            return ca::core::Ok(HttpAuthorizationDecision::authorized(""));
+
+        ca::http::HttpResponse response;
+        response.status = 401;
+        auto challenge  = response.headers.append("WWW-Authenticate", "Bearer realm=\"mcp\"");
+        if (challenge.is_err()) return ca::core::Err(std::move(challenge).unwrap_err());
+        return ca::core::Ok(HttpAuthorizationDecision::rejected(
+            ca::http::HttpServerResponse::buffered(std::move(response))));
+    };
+
+    std::mutex               identities_mutex;
+    std::vector<std::string> factory_identities;
+    auto                     server = TestServer::start(
+        [&](const HttpSessionContext& context) -> McpResult<ServerSession> {
+            std::lock_guard<std::mutex> lock(identities_mutex);
+            factory_identities.emplace_back(context.authorization_identity);
+            return make_session();
+        },
+        std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    ca::http::HttpRequest get;
+    auto                  unauthorized = send(client, server->url(), std::move(get));
+    EXPECT_EQ(unauthorized.status, 401);
+    EXPECT_EQ(unauthorized.headers.get("WWW-Authenticate"), "Bearer realm=\"mcp\"");
+
+    auto empty_identity =
+        send(client, server->url(), with_authorization(post_request(INITIALIZE), "Bearer empty"));
+    EXPECT_EQ(empty_identity.status, 500);
+    EXPECT_EQ(server->session_count(), 0U);
+
+    auto initialized =
+        send(client, server->url(), with_authorization(post_request(INITIALIZE), "Bearer alice"));
+    ASSERT_EQ(initialized.status, 200);
+    const auto session_id = required_session_id(initialized);
+    {
+        std::lock_guard<std::mutex> lock(identities_mutex);
+        ASSERT_EQ(factory_identities.size(), 1U);
+        EXPECT_EQ(factory_identities.front(), "alice");
+    }
+
+    auto ready = send(
+        client,
+        server->url(),
+        with_authorization(post_request(R"({"jsonrpc":"2.0","method":"notifications/initialized"})",
+                                        session_id,
+                                        "2025-11-25"),
+                           "Bearer alice"));
+    ASSERT_EQ(ready.status, 202);
+
+    auto wrong_identity = send(
+        client,
+        server->url(),
+        with_authorization(
+            post_request(R"({"jsonrpc":"2.0","id":2,"method":"ping"})", session_id, "2025-11-25"),
+            "Bearer bob"));
+    EXPECT_EQ(wrong_identity.status, 404);
+    EXPECT_EQ(server->session_count(), 1U);
+
+    auto ping = send(
+        client,
+        server->url(),
+        with_authorization(
+            post_request(R"({"jsonrpc":"2.0","id":3,"method":"ping"})", session_id, "2025-11-25"),
+            "Bearer alice"));
+    EXPECT_EQ(ping.status, 200);
+
+    ca::http::HttpRequest remove;
+    remove.method = "DELETE";
+    ASSERT_TRUE(remove.headers.append("MCP-Session-Id", session_id).is_ok());
+    ASSERT_TRUE(remove.headers.append("MCP-Protocol-Version", "2025-11-25").is_ok());
+    auto removed =
+        send(client, server->url(), with_authorization(std::move(remove), "Bearer alice"));
+    EXPECT_EQ(removed.status, 204);
+    EXPECT_EQ(server->session_count(), 0U);
+}
+
 TEST(StreamableHttpServerTest, MapsMalformedAndInvalidMessagesToJsonRpcErrors)
 {
-    auto server = TestServer::start(make_session);
+    auto server = TestServer::start(make_session_factory());
     ASSERT_NE(server, nullptr);
     auto client = make_client();
 
@@ -412,7 +514,7 @@ TEST(StreamableHttpServerTest, MapsMalformedAndInvalidMessagesToJsonRpcErrors)
 
 TEST(StreamableHttpServerTest, ReportsFactoryFailureAndSessionCapacity)
 {
-    auto failing = TestServer::start([]() -> McpResult<ServerSession> {
+    auto failing = TestServer::start([](const HttpSessionContext&) -> McpResult<ServerSession> {
         return ca::core::Err(
             McpError::from_kind(McpErrorKind::InvalidState, "factory test failure"));
     });
@@ -423,7 +525,9 @@ TEST(StreamableHttpServerTest, ReportsFactoryFailureAndSessionCapacity)
     StreamableHttpServerOptions throwing_options;
     throwing_options.max_sessions = 1;
     auto throwing                 = TestServer::start(
-        []() -> McpResult<ServerSession> { throw std::runtime_error("factory failure"); },
+        [](const HttpSessionContext&) -> McpResult<ServerSession> {
+            throw std::runtime_error("factory failure");
+        },
         std::move(throwing_options));
     ASSERT_NE(throwing, nullptr);
     auto throwing_client = make_client();
@@ -433,7 +537,7 @@ TEST(StreamableHttpServerTest, ReportsFactoryFailureAndSessionCapacity)
 
     StreamableHttpServerOptions options;
     options.max_sessions = 1;
-    auto limited         = TestServer::start(make_session, std::move(options));
+    auto limited         = TestServer::start(make_session_factory(), std::move(options));
     ASSERT_NE(limited, nullptr);
     auto limited_client = make_client();
     EXPECT_EQ(send(limited_client, limited->url(), post_request(INITIALIZE)).status, 200);
@@ -443,7 +547,7 @@ TEST(StreamableHttpServerTest, ReportsFactoryFailureAndSessionCapacity)
 
 TEST(StreamableHttpServerTest, RemovesSessionAfterUnhandledFailure)
 {
-    auto server = TestServer::start([]() -> McpResult<ServerSession> {
+    auto server = TestServer::start([](const HttpSessionContext&) -> McpResult<ServerSession> {
         auto created = make_session();
         if (created.is_err()) return ca::core::Err(std::move(created).unwrap_err());
         auto session = std::move(created).unwrap();
@@ -486,7 +590,7 @@ TEST(StreamableHttpServerTest, SerializesConcurrentRequestsWithinSession)
         std::atomic<ca::i32> maximum{0};
     };
     auto state  = std::make_shared<ConcurrencyState>();
-    auto server = TestServer::start([state]() -> McpResult<ServerSession> {
+    auto server = TestServer::start([state](const HttpSessionContext&) -> McpResult<ServerSession> {
         auto created = make_session();
         if (created.is_err()) return ca::core::Err(std::move(created).unwrap_err());
         auto session = std::move(created).unwrap();
@@ -546,19 +650,23 @@ TEST(StreamableHttpServerTest, ValidatesAdapterOptions)
 
     StreamableHttpServerOptions invalid_endpoint;
     invalid_endpoint.endpoint = "mcp";
-    EXPECT_TRUE(StreamableHttpServer::create(make_session, std::move(invalid_endpoint)).is_err());
+    EXPECT_TRUE(
+        StreamableHttpServer::create(make_session_factory(), std::move(invalid_endpoint)).is_err());
 
     StreamableHttpServerOptions invalid_capacity;
     invalid_capacity.max_sessions = 0;
-    EXPECT_TRUE(StreamableHttpServer::create(make_session, std::move(invalid_capacity)).is_err());
+    EXPECT_TRUE(
+        StreamableHttpServer::create(make_session_factory(), std::move(invalid_capacity)).is_err());
 
     StreamableHttpServerOptions invalid_random;
     invalid_random.session_id_bytes = 1;
-    EXPECT_TRUE(StreamableHttpServer::create(make_session, std::move(invalid_random)).is_err());
+    EXPECT_TRUE(
+        StreamableHttpServer::create(make_session_factory(), std::move(invalid_random)).is_err());
 
     StreamableHttpServerOptions duplicate_origins;
     duplicate_origins.allowed_origins = {"https://example.com", "https://example.com"};
-    EXPECT_TRUE(StreamableHttpServer::create(make_session, std::move(duplicate_origins)).is_err());
+    EXPECT_TRUE(StreamableHttpServer::create(make_session_factory(), std::move(duplicate_origins))
+                    .is_err());
 }
 
 }   // namespace

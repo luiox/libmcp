@@ -2,7 +2,7 @@ target("libmcp")
     set_kind("static")
     set_group("libs")
 
-    add_deps("libca_core", "libca_str", "libca_json", "libca_io")
+    add_deps("libca_core", "libca_str", "libca_json", "libca_io", "libca_http", "libca_crypto")
     add_files("src/mcp/*.cpp")
     add_headerfiles("src/mcp/**.hpp")
     add_includedirs("src", {public = true})
@@ -18,7 +18,8 @@ if has_config("with_tests") then
         set_default(false)
 
         add_deps("libmcp", "test_helper")
-        add_links("libmcp", "libca_json", "libca_str", "libca_io", "libca_core")
+        add_links("libmcp", "libca_http", "libca_crypto", "libca_json", "libca_str",
+                  "libca_net", "libca_io", "libca_thread", "libca_core")
         add_packages("gtest")
         add_files("unittest/main.cpp")
         add_files("unittest/*_test.cpp")

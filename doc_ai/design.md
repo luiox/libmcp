@@ -21,8 +21,18 @@ JSON-RPC 层只负责 wire message 的 UTF-8、JSON 与基础结构约束，不�
 之外。stdio 按 MCP 2025-11-25 使用 newline framing；旧实现的 `Content-Length` framing
 不属于当前 MCP stdio transport。
 
-HTTP 层后续只使用单一 MCP endpoint，POST/GET/DELETE、SSE 和 session 语义放在 libmcp，
-HTTP/1 framing、deadline、连接与路由仍由 libca_http 负责。
+HTTP 层使用单一 MCP endpoint。libmcp 负责 POST/GET/DELETE、Origin、协议版本和 session
+语义，HTTP/1 framing、deadline、连接与路由仍由 libca_http 负责。首版 POST 每次完整缓冲一条
+JSON-RPC message，GET 返回 405；SSE 与 resumability 后续在相同 adapter 内扩展，不下沉到
+libca_http。
+
+每次 initialize 通过 `HttpSessionFactory` 创建独立 `ServerSession`，安全随机 session id 只在
+initialize 成功后发给 client。全局 map mutex 只保护 session 目录和容量预留，不在持锁时调用
+factory；每个 session 的独立 mutex 保证来自多个 HTTP connection 的 message 串行进入非线程安全的
+`ServerSession`。DELETE 先标记 session 失效再从目录移除，避免已取得共享引用但尚未进入 handler
+的并发 POST 在删除完成后继续执行。
+factory 或 session handler 的异常会转换为 HTTP 500；初始化失败释放容量预留，已有 session 的
+不可恢复错误会先标记失效再从目录移除，避免后续请求继续进入可能损坏的状态。
 
 ## server session
 

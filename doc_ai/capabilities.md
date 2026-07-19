@@ -32,9 +32,19 @@
 - 安装 registry 时自动声明静态 tools capability，并冻结目录以兑现 `listChanged=false`。
 - handler 的 CallToolResult 至少校验 content array、structuredContent object 与 isError bool。
 
+## Streamable HTTP
+
+- 在单一 endpoint 上接收一条 JSON-RPC message 的 POST，并返回 buffered `application/json`
+  response；notification 与 client response 返回 HTTP 202。
+- initialize 为每个 client 创建独立 `ServerSession`，使用系统安全随机数生成 session id，
+  后续请求校验 `MCP-Session-Id` 与协商的 `MCP-Protocol-Version`。
+- 对同一 session 串行执行 message，不同 session 可由 libca HTTP worker 并发处理。
+- 精确校验 Origin allowlist、JSON Content-Type 与 JSON/SSE Accept 声明，并限制 session 总数。
+- DELETE 终止 session；GET 校验 Origin 后返回 405，明确当前未开放独立 SSE stream。
+
 ## 尚未实现
 
 - resource/prompt registry 与 dispatcher。
-- Streamable HTTP、SSE、session 与 resumability。
-- HTTP authorization hook 和 Origin 校验。
+- Streamable HTTP SSE、resumability 与 session expiry。
+- HTTP authorization hook、HTTPS 与 proxy-aware public origin policy。
 - client capability 的持久化与 server-initiated request。

@@ -1,12 +1,16 @@
 #include "mcp/streamable_http_server.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <libca/crypto/hex.hpp>
 #include <libca/crypto/random.hpp>
@@ -17,6 +21,7 @@ namespace {
 
 constexpr const char* SESSION_HEADER           = "MCP-Session-Id";
 constexpr const char* PROTOCOL_VERSION_HEADER  = "MCP-Protocol-Version";
+constexpr const char* LAST_EVENT_ID_HEADER     = "Last-Event-ID";
 constexpr ca::i64     JSON_RPC_INVALID_REQUEST = -32600;
 constexpr ca::i64     JSON_RPC_PARSE_ERROR     = -32700;
 constexpr ca::usize   SESSION_ID_ATTEMPTS      = 8;
@@ -164,6 +169,21 @@ ca::http::HttpResult<ca::http::HttpServerResponse> json_rpc_error(ca::u16 status
     return json_response(status, std::move(response).unwrap());
 }
 
+std::string encode_sse_event(std::string_view id, std::string_view data)
+{
+    std::string encoded;
+    encoded.reserve(id.size() + data.size() + 14);
+    encoded += "id: ";
+    encoded.append(id.data(), id.size());
+    encoded += "\ndata:";
+    if (!data.empty()) {
+        encoded += ' ';
+        encoded.append(data.data(), data.size());
+    }
+    encoded += "\n\n";
+    return encoded;
+}
+
 bool valid_endpoint(const std::string& endpoint) noexcept
 {
     if (endpoint.empty() || endpoint.front() != '/' || endpoint.find('?') != std::string::npos ||
@@ -276,7 +296,7 @@ public:
         }
         auto response = std::move(handled).unwrap();
         if (!response.has_value()) return buffered_response(202);
-        return json_response(200, *response);
+        return message_response(*record, *response, request.version);
     }
 
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_get(
@@ -288,16 +308,36 @@ public:
         auto rejection = std::move(authorization).unwrap();
         if (rejection.has_value()) return ca::core::Ok(std::move(*rejection));
 
-        ca::http::HttpResponse response;
-        response.status   = 405;
-        auto content_type = response.headers.append("Content-Type", "text/plain; charset=utf-8");
-        if (content_type.is_err()) return ca::core::Err(std::move(content_type).unwrap_err());
-        auto allow = response.headers.append("Allow", "POST, DELETE");
-        if (allow.is_err()) return ca::core::Err(std::move(allow).unwrap_err());
-        constexpr std::string_view body = "Standalone SSE stream is not supported\n";
-        response.body                   = ca::core::Bytes::copy_from_slice(
-            reinterpret_cast<const ca::u8*>(body.data()), body.size());
-        return ca::core::Ok(ca::http::HttpServerResponse::buffered(std::move(response)));
+        if (!options_.sse.has_value()) return get_not_supported_response();
+
+        const auto& request           = context.request();
+        bool        repeated_event_id = false;
+        auto        last_event_id =
+            single_header(request.headers, LAST_EVENT_ID_HEADER, repeated_event_id);
+        if (repeated_event_id) return text_response(400, "Last-Event-ID must occur exactly once\n");
+        if (!last_event_id.has_value()) return get_not_supported_response();
+        if (last_event_id->empty()) return text_response(400, "Last-Event-ID must not be empty\n");
+        if (!accepts(request.headers, "text/event-stream"))
+            return text_response(406, "Accept must include text/event-stream\n");
+
+        bool repeated_session = false;
+        auto session_id       = single_header(request.headers, SESSION_HEADER, repeated_session);
+        if (repeated_session) return text_response(400, "MCP-Session-Id must occur exactly once\n");
+        if (!session_id.has_value() || session_id->empty())
+            return text_response(400, "MCP-Session-Id is required\n");
+
+        auto record = find_session(*session_id);
+        if (record == nullptr) return text_response(404, "MCP session not found\n");
+
+        std::lock_guard<std::mutex> lock(record->mutex);
+        if (!record->active || record->authorization_identity != authorization_identity)
+            return text_response(404, "MCP session not found\n");
+        auto version_error = validate_protocol_version(request.headers, record->session);
+        if (version_error.has_value()) return text_response(400, *version_error);
+
+        auto cursor = find_replay_cursor(*record, *last_event_id);
+        if (!cursor.has_value()) return text_response(404, "MCP SSE stream not found\n");
+        return build_sse_response(cursor->stream, cursor->first_event);
     }
 
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_delete(
@@ -352,6 +392,24 @@ public:
     }
 
 private:
+    struct SseEvent
+    {
+        std::string id;
+        std::string encoded;
+    };
+
+    struct SseReplayStream
+    {
+        std::vector<SseEvent> events;
+        ca::usize             encoded_bytes{0};
+    };
+
+    struct SseReplayCursor
+    {
+        std::shared_ptr<const SseReplayStream> stream;
+        ca::usize                              first_event{0};
+    };
+
     struct SessionRecord
     {
         SessionRecord(ServerSession value, std::string identity)
@@ -359,11 +417,114 @@ private:
             , authorization_identity(std::move(identity))
         {}
 
-        std::mutex    mutex;
-        ServerSession session;
-        std::string   authorization_identity;
-        bool          active{true};
+        std::mutex                                         mutex;
+        ServerSession                                      session;
+        std::string                                        authorization_identity;
+        std::deque<std::shared_ptr<const SseReplayStream>> replay_streams;
+        ca::usize                                          replay_bytes{0};
+        ca::u64                                            next_stream_id{1};
+        bool                                               active{true};
     };
+
+    ca::http::HttpResult<ca::http::HttpServerResponse> get_not_supported_response() const
+    {
+        ca::http::HttpResponse response;
+        response.status   = 405;
+        auto content_type = response.headers.append("Content-Type", "text/plain; charset=utf-8");
+        if (content_type.is_err()) return ca::core::Err(std::move(content_type).unwrap_err());
+        auto allow = response.headers.append("Allow", "POST, DELETE");
+        if (allow.is_err()) return ca::core::Err(std::move(allow).unwrap_err());
+        constexpr std::string_view body = "Standalone SSE stream is not supported\n";
+        response.body                   = ca::core::Bytes::copy_from_slice(
+            reinterpret_cast<const ca::u8*>(body.data()), body.size());
+        return ca::core::Ok(ca::http::HttpServerResponse::buffered(std::move(response)));
+    }
+
+    ca::http::HttpResult<ca::http::HttpServerResponse> build_sse_response(
+        std::shared_ptr<const SseReplayStream> stream, ca::usize first_event,
+        std::optional<std::string_view> session_id = std::nullopt) const
+    {
+        ca::http::HttpResponseHead response;
+        response.status   = 200;
+        auto content_type = response.headers.append("Content-Type", "text/event-stream");
+        if (content_type.is_err()) return ca::core::Err(std::move(content_type).unwrap_err());
+        auto cache_control = response.headers.append("Cache-Control", "no-cache");
+        if (cache_control.is_err()) return ca::core::Err(std::move(cache_control).unwrap_err());
+        if (session_id.has_value()) {
+            auto appended = response.headers.append(SESSION_HEADER, std::string(*session_id));
+            if (appended.is_err()) return ca::core::Err(std::move(appended).unwrap_err());
+        }
+
+        auto producer = [stream = std::move(stream), first_event](
+                            ca::http::Http1ChunkedBodyWriter& writer,
+                            const ca::thread::StopToken& stop_token) -> ca::http::HttpResult<void> {
+            for (ca::usize index = first_event; index < stream->events.size(); ++index) {
+                if (stop_token.stop_requested())
+                    return ca::core::Err(ca::http::HttpError::from_kind(
+                        ca::http::HttpErrorKind::InvalidState, "MCP SSE response was stopped"));
+                auto written = writer.write_chunk(stream->events[index].encoded);
+                if (written.is_err()) return ca::core::Err(std::move(written).unwrap_err());
+                auto flushed = writer.flush();
+                if (flushed.is_err()) return ca::core::Err(std::move(flushed).unwrap_err());
+            }
+            return ca::core::Ok();
+        };
+        return ca::core::Ok(
+            ca::http::HttpServerResponse::chunked(std::move(response), std::move(producer)));
+    }
+
+    void remember_replay_stream(SessionRecord&                                record,
+                                const std::shared_ptr<const SseReplayStream>& stream)
+    {
+        const auto& sse = *options_.sse;
+        if (stream->encoded_bytes > sse.max_replay_bytes) return;
+        while (!record.replay_streams.empty() &&
+               (record.replay_streams.size() >= sse.max_replay_streams ||
+                record.replay_bytes > sse.max_replay_bytes - stream->encoded_bytes)) {
+            record.replay_bytes -= record.replay_streams.front()->encoded_bytes;
+            record.replay_streams.pop_front();
+        }
+        record.replay_bytes += stream->encoded_bytes;
+        record.replay_streams.push_back(stream);
+    }
+
+    ca::http::HttpResult<ca::http::HttpServerResponse> message_response(
+        SessionRecord& record, const JsonRpcMessage& message, ca::http::HttpVersion version,
+        std::optional<std::string_view> session_id = std::nullopt)
+    {
+        if (!options_.sse.has_value() || version != ca::http::HttpVersion::Http11)
+            return json_response(200, message, session_id);
+        if (record.next_stream_id == 0)
+            return ca::core::Err(ca::http::HttpError::from_kind(
+                ca::http::HttpErrorKind::InvalidState, "MCP SSE stream id space is exhausted"));
+
+        const auto encoded_message = message.serialize();
+        const auto message_view    = std::string_view(
+            reinterpret_cast<const char*>(encoded_message.data()), encoded_message.size());
+        const auto stream_id = std::to_string(record.next_stream_id++);
+        auto       stream    = std::make_shared<SseReplayStream>();
+        stream->events.reserve(2);
+        stream->events.push_back(
+            SseEvent{stream_id + ":0", encode_sse_event(stream_id + ":0", {})});
+        stream->events.push_back(
+            SseEvent{stream_id + ":1", encode_sse_event(stream_id + ":1", message_view)});
+        for (const auto& event : stream->events) stream->encoded_bytes += event.encoded.size();
+
+        remember_replay_stream(record, stream);
+        return build_sse_response(std::move(stream), 0, session_id);
+    }
+
+    std::optional<SseReplayCursor> find_replay_cursor(const SessionRecord& record,
+                                                      std::string_view     last_event_id) const
+    {
+        for (const auto& stream : record.replay_streams) {
+            for (ca::usize index = 0; index < stream->events.size(); ++index) {
+                if (stream->events[index].id == last_event_id)
+                    return SseReplayCursor{stream, index + 1};
+            }
+        }
+        return std::nullopt;
+    }
 
     ca::http::HttpResult<std::optional<ca::http::HttpServerResponse>> authorize_request(
         const ca::http::HttpServerRequestContext& context, std::string& identity)
@@ -485,7 +646,8 @@ private:
             auto       random_bytes = std::move(random).unwrap();
             const auto id           = ca::crypto::hex_encode(
                 ca::core::ByteSlice(random_bytes.as_ptr(), random_bytes.remaining()));
-            auto http_response = json_response(200, *response, id);
+            auto http_response =
+                message_response(*record, *response, context.request().version, id);
             if (http_response.is_err()) {
                 release_reservation();
                 return http_response;
@@ -582,6 +744,10 @@ McpResult<StreamableHttpServer> StreamableHttpServer::create(HttpSessionFactory 
     if (options.session_id_bytes < 16 || options.session_id_bytes > 64)
         return ca::core::Err(McpError::from_kind(
             McpErrorKind::InvalidState, "MCP HTTP session_id_bytes must be between 16 and 64"));
+    if (options.sse.has_value() &&
+        (options.sse->max_replay_streams == 0 || options.sse->max_replay_bytes == 0))
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidState,
+                                                 "MCP HTTP SSE replay limits must be positive"));
     for (ca::usize index = 0; index < options.allowed_origins.size(); ++index) {
         const auto& origin = options.allowed_origins[index];
         if (origin.empty() || !ca::http::HttpHeaders::valid_value(origin))

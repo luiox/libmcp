@@ -22,9 +22,17 @@ JSON-RPC 层只负责 wire message 的 UTF-8、JSON 与基础结构约束，不�
 不属于当前 MCP stdio transport。
 
 HTTP 层使用单一 MCP endpoint。libmcp 负责 POST/GET/DELETE、Origin、协议版本和 session
-语义，HTTP/1 framing、deadline、连接与路由仍由 libca_http 负责。首版 POST 每次完整缓冲一条
-JSON-RPC message，GET 返回 405；SSE 与 resumability 后续在相同 adapter 内扩展，不下沉到
-libca_http。
+语义，HTTP/1 framing、deadline、连接与路由仍由 libca_http 负责。POST 每次完整缓冲一条入站
+JSON-RPC message；成功 request response 默认返回 `application/json`，启用 SSE 后通过
+libca_http chunked producer 发送 priming event 与最终 JSON-RPC response。普通 GET 返回 405，
+携带 `Last-Event-ID` 的 GET 用于断线重放。由于 libca 的 chunked response 是 HTTP/1.1 能力，
+HTTP/1.0 request 即使启用 SSE 也回退到合法的单个 `application/json` response。
+
+每个 SSE stream 的 event id 由 session 内单调 stream id 与 event 序号组成，保证同一 session
+内唯一并能精确关联原 stream。replay history 保存完整编码事件，并同时按 stream 数量与编码
+字节数淘汰最旧 stream；单个 stream 超过字节上限时仍可发送，但不保留重放副本。恢复请求只会
+返回命中 event 之后的同 stream 事件，不会把其它并发 POST 的 response 混入。当前不开放没有
+业务消息来源的独立 GET stream，避免用 keepalive 占位伪装 server-to-client 能力。
 
 Origin allowlist 通过 libca_http pre-routing middleware 执行，并只匹配配置的 MCP endpoint。
 因此未知 method 在生成 405 前同样受 Origin 约束，而同一个 `HttpServer` 上的其它 endpoint 不受

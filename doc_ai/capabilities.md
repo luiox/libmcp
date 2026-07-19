@@ -34,8 +34,9 @@
 
 ## Streamable HTTP
 
-- 在单一 endpoint 上接收一条 JSON-RPC message 的 POST，并返回 buffered `application/json`
-  response；notification 与 client response 返回 HTTP 202。
+- 在单一 endpoint 上接收一条 JSON-RPC message 的 POST；request 可返回 buffered
+  `application/json`，也可配置为带 event id 的 `text/event-stream`；notification 与 client
+  response 返回 HTTP 202。
 - initialize 为每个 client 创建独立 `ServerSession`，使用系统安全随机数生成 session id，
   后续请求校验 `MCP-Session-Id` 与协商的 `MCP-Protocol-Version`。
 - 对同一 session 串行执行 message，不同 session 可由 libca HTTP worker 并发处理。
@@ -43,11 +44,16 @@
   与 JSON/SSE Accept 声明，并限制 session 总数。
 - 可选 authorizer 为 POST/GET/DELETE 返回自定义拒绝响应或稳定主体 identity；identity 会传给
   session factory 并绑定 session，阻止其它主体复用 session id。
-- DELETE 终止 session；GET 返回 405，明确当前未开放独立 SSE stream。
+- DELETE 终止 session；不带 replay cursor 的普通 GET 返回 405，明确当前未开放独立 SSE
+  stream。
+- SSE response 先发送空 data priming event，再发送最终 JSON-RPC response，并按 session 同时
+  限制 replay stream 数与编码字节数。
+- GET 携带 `Last-Event-ID` 时只重放该 event 所属 stream 的后续事件；未知或已淘汰 cursor
+  返回 404，普通 GET 仍返回 405。
 
 ## 尚未实现
 
 - resource/prompt registry 与 dispatcher。
-- Streamable HTTP SSE、resumability 与 session expiry。
+- Streamable HTTP 独立 GET stream 与 session expiry。
 - HTTPS 与 proxy-aware public origin policy。
 - client capability 的持久化与 server-initiated request。

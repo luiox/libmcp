@@ -67,21 +67,36 @@ struct HttpSessionContext
 /// @note 不同连接上的 initialize 可并发调用，factory 必须自行同步共享状态。
 using HttpSessionFactory = std::function<McpResult<ServerSession>(const HttpSessionContext&)>;
 
-/// @brief buffered Streamable HTTP 服务端的 endpoint、安全与 session 限制。
+/// @brief Streamable HTTP SSE response 与断线重放限制。
+struct StreamableHttpSseOptions
+{
+    /// @brief 每个 session 最多保留的已终止 SSE stream 数量。
+    ca::usize max_replay_streams{64};
+
+    /// @brief 每个 session 最多保留的 SSE 编码字节数。
+    /// @note 单个 stream 超过该限制时仍会发送，但不会进入 replay history。
+    ca::usize max_replay_bytes{4 * 1024 * 1024};
+};
+
+/// @brief Streamable HTTP 服务端的 endpoint、安全、SSE 与 session 限制。
 struct StreamableHttpServerOptions
 {
     std::string endpoint{"/mcp"};   ///< 单一 MCP origin-form endpoint。
     std::vector<std::string> allowed_origins;   ///< 允许的 Origin 精确值；空列表拒绝全部 Origin。
     HttpRequestAuthorizer authorizer;   ///< 可选的每 request authorization；空回调表示禁用。
+    /// @brief 设置后使用带 event id 的 SSE 返回 JSON-RPC request response。
+    /// @note HTTP/1.0 自动回退 application/json；GET 仅用于携带 Last-Event-ID 重放已终止
+    /// stream，不开放独立消息 stream。
+    std::optional<StreamableHttpSseOptions> sse;
     ca::usize max_sessions{1024};   ///< 同时保留的 session 上限。
     ca::usize session_id_bytes{32};   ///< 安全随机 session id 的原始字节数，范围 16-64。
     bool require_protocol_version_header{true};   ///< 后续请求是否强制携带协商版本。
 };
 
-/// @brief 将独立 ServerSession 安装到 libca HttpServer 的 buffered Streamable HTTP adapter。
-/// @details 当前支持 POST JSON、DELETE session、Origin 与可选 authorization；GET 返回 405，
-/// 不提供 SSE、resumability 或 server-initiated request。不同 HTTP 连接可并发处理，不同 session
-/// 相互独立，同一 session 内的消息按 handler 获得锁的顺序串行执行。
+/// @brief 将独立 ServerSession 安装到 libca HttpServer 的 Streamable HTTP adapter。
+/// @details 支持 buffered 或 SSE POST response、Last-Event-ID 重放、DELETE session、Origin
+/// 与可选 authorization；不提供独立 GET stream 或 server-initiated request。不同 HTTP 连接可
+/// 并发处理，不同 session 相互独立，同一 session 内的消息按 handler 获得锁的顺序串行执行。
 class StreamableHttpServer
 {
 public:

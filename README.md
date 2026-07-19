@@ -12,9 +12,9 @@
 - 服务端 initialize/initialized/ready 生命周期、版本协商、ping 与同步 method 分发。
 - 可直接运行至 EOF 且能恢复单行 JSON 错误的 stdio server loop。
 - 拥有完整 descriptor 的静态 tool registry，以及 tools/list、tools/call 分发。
-- 基于 libca HTTP/net 的 buffered Streamable HTTP server、Origin allowlist、authorization hook
-  与并发 session 管理。
+- 基于 libca HTTP/net 的 Streamable HTTP server、可选 SSE response 与 Last-Event-ID 重放、
+  Origin allowlist、authorization hook 与并发 session 管理。
 
-Streamable HTTP 的 SSE/resumability、HTTPS 和 resources/prompts feature registry 将在后续
-增量加入。
+Streamable HTTP 的独立 GET stream、server-initiated request、HTTPS 和 resources/prompts
+feature registry 将在后续增量加入。
 MCP wire format 使用 JSON-RPC，不需要 XML。

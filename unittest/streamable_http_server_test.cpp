@@ -198,6 +198,59 @@ ca::i64 json_rpc_error_code(const ca::http::HttpResponse& response)
     return code == nullptr ? 0 : code->as_int();
 }
 
+struct SseTestEvent
+{
+    std::string id;
+    std::string data;
+};
+
+std::vector<SseTestEvent> parse_sse_events(const ca::core::Bytes& body)
+{
+    const auto                encoded = body_text(body);
+    std::vector<SseTestEvent> events;
+    ca::usize                 offset = 0;
+    while (offset < encoded.size()) {
+        const auto ending = encoded.find("\n\n", offset);
+        EXPECT_NE(ending, std::string::npos);
+        if (ending == std::string::npos) break;
+
+        const auto   block = std::string_view(encoded).substr(offset, ending - offset);
+        SseTestEvent event;
+        bool         saw_data   = false;
+        ca::usize    line_start = 0;
+        while (line_start <= block.size()) {
+            const auto line_end = block.find('\n', line_start);
+            const auto line     = block.substr(line_start, line_end - line_start);
+            if (line.substr(0, 4) == "id: ") {
+                event.id = std::string(line.substr(4));
+            }
+            else if (line == "data:" || line.substr(0, 6) == "data: ") {
+                if (saw_data) event.data += '\n';
+                if (line.size() > 5) event.data.append(line.substr(6));
+                saw_data = true;
+            }
+            if (line_end == std::string_view::npos) break;
+            line_start = line_end + 1;
+        }
+        EXPECT_FALSE(event.id.empty());
+        EXPECT_TRUE(saw_data);
+        events.push_back(std::move(event));
+        offset = ending + 2;
+    }
+    return events;
+}
+
+ca::http::HttpRequest replay_request(std::string_view session_id, std::string_view event_id)
+{
+    ca::http::HttpRequest request;
+    request.method = "GET";
+    EXPECT_TRUE(request.headers.append("Accept", "text/event-stream").is_ok());
+    EXPECT_TRUE(request.headers.append("MCP-Session-Id", std::string(session_id)).is_ok());
+    EXPECT_TRUE(request.headers.append("MCP-Protocol-Version", "2025-11-25").is_ok());
+    EXPECT_TRUE(request.headers.append("Last-Event-ID", std::string(event_id)).is_ok());
+    return request;
+}
+
 TEST(StreamableHttpServerTest, InitializesSessionAndHandlesBufferedMessages)
 {
     auto server = TestServer::start(make_session_factory());
@@ -241,6 +294,172 @@ TEST(StreamableHttpServerTest, InitializesSessionAndHandlesBufferedMessages)
              server->url(),
              post_request(R"({"jsonrpc":"2.0","id":99,"result":{}})", session_id, "2025-11-25"));
     EXPECT_EQ(client_response.status, 202);
+}
+
+TEST(StreamableHttpServerTest, StreamsResponsesAndResumesOnlyTheOriginatingStream)
+{
+    StreamableHttpServerOptions options;
+    options.sse.emplace();
+    auto server = TestServer::start(make_session_factory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto initialized = send(client, server->url(), post_request(INITIALIZE));
+    ASSERT_EQ(initialized.status, 200);
+    EXPECT_EQ(initialized.headers.get("Content-Type"), "text/event-stream");
+    EXPECT_EQ(initialized.headers.get("Cache-Control"), "no-cache");
+    const auto session_id        = required_session_id(initialized);
+    const auto initialize_events = parse_sse_events(initialized.body);
+    ASSERT_EQ(initialize_events.size(), 2U);
+    EXPECT_TRUE(initialize_events.front().data.empty());
+    EXPECT_NE(initialize_events[0].id, initialize_events[1].id);
+    auto initialize_message =
+        JsonRpcMessage::parse(ca::str::Utf8StringRef::from_string_view(initialize_events[1].data));
+    ASSERT_TRUE(initialize_message.is_ok());
+    EXPECT_NE(std::move(initialize_message).unwrap().result(), nullptr);
+
+    auto ready = send(
+        client,
+        server->url(),
+        post_request(
+            R"({"jsonrpc":"2.0","method":"notifications/initialized"})", session_id, "2025-11-25"));
+    ASSERT_EQ(ready.status, 202);
+
+    auto first =
+        send(client,
+             server->url(),
+             post_request(R"({"jsonrpc":"2.0","id":2,"method":"ping"})", session_id, "2025-11-25"));
+    ASSERT_EQ(first.status, 200);
+    const auto first_events = parse_sse_events(first.body);
+    ASSERT_EQ(first_events.size(), 2U);
+    EXPECT_TRUE(first_events.front().data.empty());
+
+    auto second =
+        send(client,
+             server->url(),
+             post_request(R"({"jsonrpc":"2.0","id":3,"method":"ping"})", session_id, "2025-11-25"));
+    ASSERT_EQ(second.status, 200);
+    const auto second_events = parse_sse_events(second.body);
+    ASSERT_EQ(second_events.size(), 2U);
+    EXPECT_NE(first_events[0].id, second_events[0].id);
+    EXPECT_NE(first_events[1].id, second_events[1].id);
+
+    ca::http::HttpRequest listen;
+    listen.method = "GET";
+    ASSERT_TRUE(listen.headers.append("Accept", "text/event-stream").is_ok());
+    ASSERT_TRUE(listen.headers.append("MCP-Session-Id", session_id).is_ok());
+    ASSERT_TRUE(listen.headers.append("MCP-Protocol-Version", "2025-11-25").is_ok());
+    auto unsupported = send(client, server->url(), std::move(listen));
+    EXPECT_EQ(unsupported.status, 405);
+    EXPECT_EQ(unsupported.headers.get("Allow"), "POST, DELETE");
+
+    auto missing_accept = replay_request(session_id, first_events.front().id);
+    missing_accept.headers.remove("Accept");
+    EXPECT_EQ(send(client, server->url(), std::move(missing_accept)).status, 406);
+
+    auto repeated_cursor = replay_request(session_id, first_events.front().id);
+    ASSERT_TRUE(repeated_cursor.headers.append("Last-Event-ID", first_events.back().id).is_ok());
+    EXPECT_EQ(send(client, server->url(), std::move(repeated_cursor)).status, 400);
+
+    EXPECT_EQ(send(client, server->url(), replay_request(session_id, "unknown:0")).status, 404);
+
+    auto resumed = send(client, server->url(), replay_request(session_id, first_events.front().id));
+    ASSERT_EQ(resumed.status, 200);
+    EXPECT_EQ(resumed.headers.get("Content-Type"), "text/event-stream");
+    const auto resumed_events = parse_sse_events(resumed.body);
+    ASSERT_EQ(resumed_events.size(), 1U);
+    EXPECT_EQ(resumed_events.front().id, first_events[1].id);
+    auto replayed_message = JsonRpcMessage::parse(
+        ca::str::Utf8StringRef::from_string_view(resumed_events.front().data));
+    ASSERT_TRUE(replayed_message.is_ok());
+    auto replayed_id = std::move(replayed_message).unwrap().copy_id();
+    ASSERT_TRUE(replayed_id.has_value());
+    ASSERT_NE(replayed_id->integer_value(), nullptr);
+    EXPECT_EQ(*replayed_id->integer_value(), 2);
+
+    auto completed =
+        send(client, server->url(), replay_request(session_id, first_events.back().id));
+    EXPECT_EQ(completed.status, 200);
+    EXPECT_TRUE(completed.body.is_empty());
+}
+
+TEST(StreamableHttpServerTest, FallsBackToBufferedResponseForHttp10)
+{
+    StreamableHttpServerOptions options;
+    options.sse.emplace();
+    auto server = TestServer::start(make_session_factory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto initialize    = post_request(INITIALIZE);
+    initialize.version = ca::http::HttpVersion::Http10;
+    auto response      = send(client, server->url(), std::move(initialize));
+    ASSERT_EQ(response.status, 200);
+    EXPECT_EQ(response.headers.get("Content-Type"), "application/json");
+    EXPECT_FALSE(required_session_id(response).empty());
+    auto message =
+        JsonRpcMessage::parse(ca::str::Utf8StringRef::from_string_view(body_text(response.body)));
+    ASSERT_TRUE(message.is_ok());
+    EXPECT_NE(std::move(message).unwrap().result(), nullptr);
+}
+
+TEST(StreamableHttpServerTest, EvictsOldSseReplayStreamsAtConfiguredCapacity)
+{
+    StreamableHttpServerOptions options;
+    options.sse.emplace();
+    options.sse->max_replay_streams = 1;
+    auto server                     = TestServer::start(make_session_factory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto initialized = send(client, server->url(), post_request(INITIALIZE));
+    ASSERT_EQ(initialized.status, 200);
+    const auto session_id        = required_session_id(initialized);
+    const auto initialize_events = parse_sse_events(initialized.body);
+    ASSERT_EQ(initialize_events.size(), 2U);
+
+    auto ready = send(
+        client,
+        server->url(),
+        post_request(
+            R"({"jsonrpc":"2.0","method":"notifications/initialized"})", session_id, "2025-11-25"));
+    ASSERT_EQ(ready.status, 202);
+    auto ping =
+        send(client,
+             server->url(),
+             post_request(R"({"jsonrpc":"2.0","id":2,"method":"ping"})", session_id, "2025-11-25"));
+    ASSERT_EQ(ping.status, 200);
+    const auto ping_events = parse_sse_events(ping.body);
+    ASSERT_EQ(ping_events.size(), 2U);
+
+    EXPECT_EQ(send(client, server->url(), replay_request(session_id, initialize_events.front().id))
+                  .status,
+              404);
+    auto replayed = send(client, server->url(), replay_request(session_id, ping_events.front().id));
+    EXPECT_EQ(replayed.status, 200);
+    const auto replayed_events = parse_sse_events(replayed.body);
+    ASSERT_EQ(replayed_events.size(), 1U);
+    EXPECT_EQ(replayed_events.front().id, ping_events.back().id);
+}
+
+TEST(StreamableHttpServerTest, SendsButDoesNotRetainSseStreamOverReplayByteLimit)
+{
+    StreamableHttpServerOptions options;
+    options.sse.emplace();
+    options.sse->max_replay_bytes = 1;
+    auto server                   = TestServer::start(make_session_factory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto initialized = send(client, server->url(), post_request(INITIALIZE));
+    ASSERT_EQ(initialized.status, 200);
+    EXPECT_EQ(initialized.headers.get("Content-Type"), "text/event-stream");
+    const auto session_id = required_session_id(initialized);
+    const auto events     = parse_sse_events(initialized.body);
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_FALSE(events.back().data.empty());
+    EXPECT_EQ(send(client, server->url(), replay_request(session_id, events.front().id)).status,
+              404);
 }
 
 TEST(StreamableHttpServerTest, ValidatesContentNegotiationAndOrigin)
@@ -402,6 +621,7 @@ TEST(StreamableHttpServerTest, ChecksOriginBeforeRoutingAndOnlyForMcpEndpoint)
 TEST(StreamableHttpServerTest, AuthorizesRequestsAndBindsIdentityToSession)
 {
     StreamableHttpServerOptions options;
+    options.sse.emplace();
     options.authorizer = [](const ca::http::HttpServerRequestContext& context)
         -> ca::http::HttpResult<HttpAuthorizationDecision> {
         const auto values = context.request().headers.get_all("Authorization");
@@ -477,6 +697,23 @@ TEST(StreamableHttpServerTest, AuthorizesRequestsAndBindsIdentityToSession)
             post_request(R"({"jsonrpc":"2.0","id":3,"method":"ping"})", session_id, "2025-11-25"),
             "Bearer alice"));
     EXPECT_EQ(ping.status, 200);
+    const auto ping_events = parse_sse_events(ping.body);
+    ASSERT_EQ(ping_events.size(), 2U);
+
+    auto wrong_replay =
+        send(client,
+             server->url(),
+             with_authorization(replay_request(session_id, ping_events.front().id), "Bearer bob"));
+    EXPECT_EQ(wrong_replay.status, 404);
+
+    auto allowed_replay = send(
+        client,
+        server->url(),
+        with_authorization(replay_request(session_id, ping_events.front().id), "Bearer alice"));
+    EXPECT_EQ(allowed_replay.status, 200);
+    const auto allowed_events = parse_sse_events(allowed_replay.body);
+    ASSERT_EQ(allowed_events.size(), 1U);
+    EXPECT_EQ(allowed_events.front().id, ping_events.back().id);
 
     ca::http::HttpRequest remove;
     remove.method = "DELETE";
@@ -662,6 +899,20 @@ TEST(StreamableHttpServerTest, ValidatesAdapterOptions)
     invalid_random.session_id_bytes = 1;
     EXPECT_TRUE(
         StreamableHttpServer::create(make_session_factory(), std::move(invalid_random)).is_err());
+
+    StreamableHttpServerOptions invalid_replay_streams;
+    invalid_replay_streams.sse.emplace();
+    invalid_replay_streams.sse->max_replay_streams = 0;
+    EXPECT_TRUE(
+        StreamableHttpServer::create(make_session_factory(), std::move(invalid_replay_streams))
+            .is_err());
+
+    StreamableHttpServerOptions invalid_replay_bytes;
+    invalid_replay_bytes.sse.emplace();
+    invalid_replay_bytes.sse->max_replay_bytes = 0;
+    EXPECT_TRUE(
+        StreamableHttpServer::create(make_session_factory(), std::move(invalid_replay_bytes))
+            .is_err());
 
     StreamableHttpServerOptions duplicate_origins;
     duplicate_origins.allowed_origins = {"https://example.com", "https://example.com"};

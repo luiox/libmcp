@@ -26,6 +26,11 @@ HTTP 层使用单一 MCP endpoint。libmcp 负责 POST/GET/DELETE、Origin、协
 JSON-RPC message，GET 返回 405；SSE 与 resumability 后续在相同 adapter 内扩展，不下沉到
 libca_http。
 
+Origin allowlist 通过 libca_http pre-routing middleware 执行，并只匹配配置的 MCP endpoint。
+因此未知 method 在生成 405 前同样受 Origin 约束，而同一个 `HttpServer` 上的其它 endpoint 不受
+libmcp 策略影响。middleware 在完整 request 读取后运行，body 资源消耗仍由 server 的
+`HttpLimits` 约束。
+
 每次 initialize 通过 `HttpSessionFactory` 创建独立 `ServerSession`，安全随机 session id 只在
 initialize 成功后发给 client。全局 map mutex 只保护 session 目录和容量预留，不在持锁时调用
 factory；每个 session 的独立 mutex 保证来自多个 HTTP connection 的 message 串行进入非线程安全的

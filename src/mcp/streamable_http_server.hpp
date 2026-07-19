@@ -44,8 +44,9 @@ public:
         StreamableHttpServerOptions options = StreamableHttpServerOptions());
 
     /// @brief 将 POST、GET 与 DELETE route 安装到 server。
-    /// @note 必须在 HttpServer::serve() 前调用；route handler 会保持 adapter 状态生命周期。
-    /// @warning HttpServer 不支持事务式 route 注册；失败后调用方应丢弃可能已部分安装的 server。
+    /// @note 必须在 HttpServer::serve() 前调用；middleware 与 route 会保持 adapter 状态生命周期。
+    /// @warning HttpServer 不支持事务式 middleware/route 注册；失败后应丢弃可能已部分安装的
+    /// server。
     ca::http::HttpResult<void> install(ca::http::HttpServer& server);
 
     /// @brief 线程安全地返回当前有效 session 数量。

@@ -356,7 +356,7 @@ TEST(StreamableHttpServerTest, DeletesSessionAndRejectsDeletedId)
     EXPECT_EQ(send(client, server->url(), std::move(remove_again)).status, 404);
 }
 
-TEST(StreamableHttpServerTest, RejectsGetAndChecksItsOrigin)
+TEST(StreamableHttpServerTest, ChecksOriginBeforeRoutingAndOnlyForMcpEndpoint)
 {
     StreamableHttpServerOptions options;
     options.allowed_origins = {"https://allowed.example"};
@@ -370,7 +370,20 @@ TEST(StreamableHttpServerTest, RejectsGetAndChecksItsOrigin)
     ca::http::HttpRequest denied;
     ASSERT_TRUE(denied.headers.append("Origin", "https://denied.example").is_ok());
     EXPECT_EQ(send(client, server->url(), std::move(denied)).status, 403);
-    EXPECT_EQ(client.get(server->url("/missing")).unwrap().status, 404);
+
+    ca::http::HttpRequest denied_method;
+    denied_method.method = "PUT";
+    ASSERT_TRUE(denied_method.headers.append("Origin", "https://denied.example").is_ok());
+    EXPECT_EQ(send(client, server->url("/mcp?q=1"), std::move(denied_method)).status, 403);
+
+    ca::http::HttpRequest allowed_method;
+    allowed_method.method = "PUT";
+    ASSERT_TRUE(allowed_method.headers.append("Origin", "https://allowed.example").is_ok());
+    EXPECT_EQ(send(client, server->url(), std::move(allowed_method)).status, 405);
+
+    ca::http::HttpRequest unrelated;
+    ASSERT_TRUE(unrelated.headers.append("Origin", "https://denied.example").is_ok());
+    EXPECT_EQ(send(client, server->url("/missing"), std::move(unrelated)).status, 404);
 }
 
 TEST(StreamableHttpServerTest, MapsMalformedAndInvalidMessagesToJsonRpcErrors)

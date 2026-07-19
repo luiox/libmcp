@@ -189,7 +189,6 @@ public:
         const ca::http::HttpServerRequestContext& context)
     {
         const auto& request = context.request();
-        if (!origin_allowed(request.headers)) return text_response(403, "Forbidden\n");
         if (!is_json_content_type(request.headers))
             return text_response(415, "Content-Type must be application/json\n");
         if (!accepts(request.headers, "application/json") ||
@@ -238,9 +237,8 @@ public:
     }
 
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_get(
-        const ca::http::HttpServerRequestContext& context)
+        const ca::http::HttpServerRequestContext&)
     {
-        if (!origin_allowed(context.request().headers)) return text_response(403, "Forbidden\n");
         ca::http::HttpResponse response;
         response.status   = 405;
         auto content_type = response.headers.append("Content-Type", "text/plain; charset=utf-8");
@@ -256,11 +254,9 @@ public:
     ca::http::HttpResult<ca::http::HttpServerResponse> handle_delete(
         const ca::http::HttpServerRequestContext& context)
     {
-        const auto& request = context.request();
-        if (!origin_allowed(request.headers)) return text_response(403, "Forbidden\n");
-
-        bool repeated_session = false;
-        auto session_id       = single_header(request.headers, SESSION_HEADER, repeated_session);
+        const auto& request          = context.request();
+        bool        repeated_session = false;
+        auto        session_id = single_header(request.headers, SESSION_HEADER, repeated_session);
         if (repeated_session) return text_response(400, "MCP-Session-Id must occur exactly once\n");
         if (!session_id.has_value() || session_id->empty())
             return text_response(400, "MCP-Session-Id is required\n");
@@ -286,6 +282,19 @@ public:
 
     const std::string& endpoint() const noexcept { return options_.endpoint; }
 
+    ca::http::HttpResult<std::optional<ca::http::HttpServerResponse>> check_origin(
+        const ca::http::HttpServerRequestContext& context)
+    {
+        if (!matches_endpoint(context.request().target) ||
+            origin_allowed(context.request().headers))
+            return ca::core::Ok(std::optional<ca::http::HttpServerResponse>{});
+
+        auto response = text_response(403, "Forbidden\n");
+        if (response.is_err()) return ca::core::Err(std::move(response).unwrap_err());
+        return ca::core::Ok(
+            std::optional<ca::http::HttpServerResponse>(std::move(response).unwrap()));
+    }
+
 private:
     struct SessionRecord
     {
@@ -306,6 +315,12 @@ private:
         return std::find(options_.allowed_origins.begin(),
                          options_.allowed_origins.end(),
                          origins.front()) != options_.allowed_origins.end();
+    }
+
+    bool matches_endpoint(std::string_view target) const noexcept
+    {
+        const auto limit = target.find_first_of("?#");
+        return target.substr(0, limit) == options_.endpoint;
     }
 
     std::optional<std::string> validate_protocol_version(const ca::http::HttpHeaders& headers,
@@ -487,7 +502,11 @@ ca::http::HttpResult<void> StreamableHttpServer::install(ca::http::HttpServer& s
     if (impl_ == nullptr)
         return ca::core::Err(ca::http::HttpError::from_kind(
             ca::http::HttpErrorKind::InvalidState, "MCP HTTP adapter has been moved from"));
-    auto impl = impl_;
+    auto impl   = impl_;
+    auto origin = server.add_middleware([impl](const ca::http::HttpServerRequestContext& context) {
+        return impl->check_origin(context);
+    });
+    if (origin.is_err()) return origin;
     auto post = server.route(
         "POST", impl->endpoint(), [impl](const ca::http::HttpServerRequestContext& context) {
             return impl->handle_post(context);

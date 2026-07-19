@@ -39,8 +39,9 @@
 - initialize 为每个 client 创建独立 `ServerSession`，使用系统安全随机数生成 session id，
   后续请求校验 `MCP-Session-Id` 与协商的 `MCP-Protocol-Version`。
 - 对同一 session 串行执行 message，不同 session 可由 libca HTTP worker 并发处理。
-- 精确校验 Origin allowlist、JSON Content-Type 与 JSON/SSE Accept 声明，并限制 session 总数。
-- DELETE 终止 session；GET 校验 Origin 后返回 405，明确当前未开放独立 SSE stream。
+- 对 MCP endpoint 的全部 method 在 route 前精确校验 Origin allowlist，再校验 JSON Content-Type
+  与 JSON/SSE Accept 声明，并限制 session 总数。
+- DELETE 终止 session；GET 返回 405，明确当前未开放独立 SSE stream。
 
 ## 尚未实现
 

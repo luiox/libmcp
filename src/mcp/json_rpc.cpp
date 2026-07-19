@@ -1,5 +1,6 @@
 #include "mcp/json_rpc.hpp"
 
+#include <cmath>
 #include <string>
 #include <utility>
 
@@ -20,6 +21,53 @@ const JsonValue* member(const JsonValue& object, const char* name) noexcept
 {
     if (!object.is_object()) return nullptr;
     return object.find(key(name));
+}
+
+bool valid_utf8(const std::string& value) noexcept
+{
+    return ca::str::utf8_is_valid(reinterpret_cast<const ca::u8*>(value.data()), value.size());
+}
+
+JsonValue id_value(ca::json::JsonDocument& document, const JsonRpcId& id)
+{
+    if (const auto* value = id.string_value())
+        return JsonValue::make_string(
+            document.arena().intern(reinterpret_cast<const ca::u8*>(value->data()), value->size()));
+    if (const auto* value = id.integer_value()) return JsonValue::make_int(*value);
+    return JsonValue::make_float(*id.number_value());
+}
+
+McpResult<void> validate_method(const std::string& method)
+{
+    if (!valid_utf8(method))
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidMessage,
+                                                 "JSON-RPC method is not valid UTF-8"));
+    return ca::core::Ok();
+}
+
+McpResult<JsonRpcMessage> make_call(JsonRpcId id, std::string method,
+                                    ca::json::JsonDocument document, bool has_params,
+                                    JsonRpcMessageKind kind)
+{
+    auto valid_method = validate_method(method);
+    if (valid_method.is_err()) return ca::core::Err(std::move(valid_method).unwrap_err());
+    if (has_params && !document.root().is_object())
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidMessage,
+                                                 "MCP JSON-RPC params must be an object"));
+
+    JsonValue params;
+    if (has_params) params = std::move(document.root());
+    JsonValue root = JsonValue::make_object();
+    root.set(document.arena().intern("jsonrpc"),
+             JsonValue::make_string(document.arena().intern("2.0")));
+    if (kind == JsonRpcMessageKind::Request)
+        root.set(document.arena().intern("id"), id_value(document, id));
+    root.set(document.arena().intern("method"),
+             JsonValue::make_string(document.arena().intern(
+                 reinterpret_cast<const ca::u8*>(method.data()), method.size())));
+    if (has_params) root.set(document.arena().intern("params"), std::move(params));
+    document.root() = std::move(root);
+    return JsonRpcMessage::from_document(std::move(document));
 }
 
 bool valid_id(const JsonValue* id) noexcept
@@ -107,6 +155,61 @@ std::string parse_error_message(const ca::json::ParseError& error)
 
 }   // namespace
 
+JsonRpcId::JsonRpcId(Storage value) noexcept
+    : value_(std::move(value))
+{}
+
+McpResult<JsonRpcId> JsonRpcId::from_string(std::string value)
+{
+    if (!valid_utf8(value))
+        return ca::core::Err(
+            McpError::from_kind(McpErrorKind::InvalidMessage, "JSON-RPC id is not valid UTF-8"));
+    return ca::core::Ok(JsonRpcId(Storage(std::move(value))));
+}
+
+JsonRpcId JsonRpcId::from_integer(ca::i64 value) noexcept
+{
+    return JsonRpcId(Storage(value));
+}
+
+McpResult<JsonRpcId> JsonRpcId::from_number(ca::f64 value)
+{
+    if (!std::isfinite(value))
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidMessage,
+                                                 "JSON-RPC numeric id must be finite"));
+    return ca::core::Ok(JsonRpcId(Storage(value)));
+}
+
+bool JsonRpcId::is_string() const noexcept
+{
+    return std::holds_alternative<std::string>(value_);
+}
+
+bool JsonRpcId::is_integer() const noexcept
+{
+    return std::holds_alternative<ca::i64>(value_);
+}
+
+bool JsonRpcId::is_number() const noexcept
+{
+    return std::holds_alternative<ca::f64>(value_);
+}
+
+const std::string* JsonRpcId::string_value() const noexcept
+{
+    return std::get_if<std::string>(&value_);
+}
+
+const ca::i64* JsonRpcId::integer_value() const noexcept
+{
+    return std::get_if<ca::i64>(&value_);
+}
+
+const ca::f64* JsonRpcId::number_value() const noexcept
+{
+    return std::get_if<ca::f64>(&value_);
+}
+
 JsonRpcMessage::JsonRpcMessage(ca::json::JsonDocument document, JsonRpcMessageKind kind) noexcept
     : document_(std::move(document))
     , kind_(kind)
@@ -134,6 +237,78 @@ McpResult<JsonRpcMessage> JsonRpcMessage::from_document(ca::json::JsonDocument d
     return ca::core::Ok(JsonRpcMessage(std::move(document), kind.unwrap()));
 }
 
+McpResult<JsonRpcMessage> JsonRpcMessage::make_request(JsonRpcId id, std::string method)
+{
+    return make_call(std::move(id),
+                     std::move(method),
+                     ca::json::JsonDocument(),
+                     false,
+                     JsonRpcMessageKind::Request);
+}
+
+McpResult<JsonRpcMessage> JsonRpcMessage::make_request(JsonRpcId id, std::string method,
+                                                       ca::json::JsonDocument params)
+{
+    return make_call(
+        std::move(id), std::move(method), std::move(params), true, JsonRpcMessageKind::Request);
+}
+
+McpResult<JsonRpcMessage> JsonRpcMessage::make_notification(std::string method)
+{
+    return make_call(JsonRpcId::from_integer(0),
+                     std::move(method),
+                     ca::json::JsonDocument(),
+                     false,
+                     JsonRpcMessageKind::Notification);
+}
+
+McpResult<JsonRpcMessage> JsonRpcMessage::make_notification(std::string            method,
+                                                            ca::json::JsonDocument params)
+{
+    return make_call(JsonRpcId::from_integer(0),
+                     std::move(method),
+                     std::move(params),
+                     true,
+                     JsonRpcMessageKind::Notification);
+}
+
+McpResult<JsonRpcMessage> JsonRpcMessage::make_result(JsonRpcId id, ca::json::JsonDocument result)
+{
+    if (!result.root().is_object())
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidMessage,
+                                                 "MCP JSON-RPC result must be an object"));
+    JsonValue result_root = std::move(result.root());
+    JsonValue root        = JsonValue::make_object();
+    root.set(result.arena().intern("jsonrpc"),
+             JsonValue::make_string(result.arena().intern("2.0")));
+    root.set(result.arena().intern("id"), id_value(result, id));
+    root.set(result.arena().intern("result"), std::move(result_root));
+    result.root() = std::move(root);
+    return from_document(std::move(result));
+}
+
+McpResult<JsonRpcMessage> JsonRpcMessage::make_error(std::optional<JsonRpcId> id, ca::i64 code,
+                                                     std::string message)
+{
+    if (!valid_utf8(message))
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidMessage,
+                                                 "JSON-RPC error message is not valid UTF-8"));
+    ca::json::JsonDocument document;
+    JsonValue              error = JsonValue::make_object();
+    error.set(document.arena().intern("code"), JsonValue::make_int(code));
+    error.set(document.arena().intern("message"),
+              JsonValue::make_string(document.arena().intern(
+                  reinterpret_cast<const ca::u8*>(message.data()), message.size())));
+
+    JsonValue root = JsonValue::make_object();
+    root.set(document.arena().intern("jsonrpc"),
+             JsonValue::make_string(document.arena().intern("2.0")));
+    if (id.has_value()) root.set(document.arena().intern("id"), id_value(document, *id));
+    root.set(document.arena().intern("error"), std::move(error));
+    document.root() = std::move(root);
+    return from_document(std::move(document));
+}
+
 JsonRpcMessageKind JsonRpcMessage::kind() const noexcept
 {
     return kind_;
@@ -152,6 +327,16 @@ const JsonValue& JsonRpcMessage::root() const noexcept
 const JsonValue* JsonRpcMessage::id() const noexcept
 {
     return member(document_.root(), "id");
+}
+
+std::optional<JsonRpcId> JsonRpcMessage::copy_id() const
+{
+    const auto* value = id();
+    if (value == nullptr) return std::nullopt;
+    if (value->is_string())
+        return JsonRpcId(JsonRpcId::Storage(value->as_string().to_std_string()));
+    if (value->is_int()) return JsonRpcId(JsonRpcId::Storage(value->as_int()));
+    return JsonRpcId(JsonRpcId::Storage(value->as_float()));
 }
 
 std::optional<Utf8StringRef> JsonRpcMessage::method() const noexcept

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -65,6 +66,51 @@ TEST(JsonRpcMessageTest, OwnsStringsAndRoundTripsCompactJson)
     auto encoded = message.serialize();
     EXPECT_EQ(encoded.to_std_string(),
               R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inspect"}})");
+}
+
+TEST(JsonRpcMessageTest, BuildsOutboundMessagesWithOwnedIdsAndDocuments)
+{
+    auto string_id = JsonRpcId::from_string("request-7");
+    ASSERT_TRUE(string_id.is_ok());
+    auto request = JsonRpcMessage::make_request(std::move(string_id).unwrap(), "tools/list");
+    ASSERT_TRUE(request.is_ok());
+    auto request_message = std::move(request).unwrap();
+    EXPECT_EQ(request_message.serialize().to_std_string(),
+              R"({"jsonrpc":"2.0","id":"request-7","method":"tools/list"})");
+
+    auto copied_id = request_message.copy_id();
+    ASSERT_TRUE(copied_id.has_value());
+    ca::json::JsonDocument result_document;
+    auto                   result = ca::json::JsonValue::make_object();
+    result.set(result_document.arena().intern("ok"), ca::json::JsonValue::make_bool(true));
+    result_document.root() = std::move(result);
+    auto response = JsonRpcMessage::make_result(std::move(*copied_id), std::move(result_document));
+    ASSERT_TRUE(response.is_ok());
+    EXPECT_EQ(std::move(response).unwrap().serialize().to_std_string(),
+              R"({"jsonrpc":"2.0","id":"request-7","result":{"ok":true}})");
+
+    auto error = JsonRpcMessage::make_error(std::nullopt, -32700, "Parse error");
+    ASSERT_TRUE(error.is_ok());
+    EXPECT_EQ(std::move(error).unwrap().serialize().to_std_string(),
+              R"({"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"}})");
+}
+
+TEST(JsonRpcMessageTest, ValidatesOutboundUtf8AndObjectPayloads)
+{
+    const std::string invalid_utf8(1, static_cast<char>(0xff));
+    EXPECT_TRUE(JsonRpcId::from_string(invalid_utf8).is_err());
+    EXPECT_TRUE(JsonRpcId::from_number(std::numeric_limits<ca::f64>::infinity()).is_err());
+    EXPECT_TRUE(JsonRpcMessage::make_notification(invalid_utf8).is_err());
+
+    ca::json::JsonDocument params;
+    params.root() = ca::json::JsonValue::make_array();
+    EXPECT_TRUE(JsonRpcMessage::make_request(JsonRpcId::from_integer(1), "ping", std::move(params))
+                    .is_err());
+
+    ca::json::JsonDocument result;
+    result.root() = ca::json::JsonValue::make_null();
+    EXPECT_TRUE(
+        JsonRpcMessage::make_result(JsonRpcId::from_integer(1), std::move(result)).is_err());
 }
 
 TEST(JsonRpcMessageTest, RejectsInvalidJsonUtf8AndBatch)

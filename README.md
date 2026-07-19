@@ -11,6 +11,7 @@
 - UTF-8、message 大小、EOF 和底层 IO 错误处理。
 - 服务端 initialize/initialized/ready 生命周期、版本协商、ping 与同步 method 分发。
 - 可直接运行至 EOF 且能恢复单行 JSON 错误的 stdio server loop。
+- 拥有完整 descriptor 的静态 tool registry，以及 tools/list、tools/call 分发。
 
-HTTP Streamable transport 和 tools/resources/prompts feature registry 将在后续增量加入。
+HTTP Streamable transport 和 resources/prompts feature registry 将在后续增量加入。
 MCP wire format 使用 JSON-RPC，不需要 XML。

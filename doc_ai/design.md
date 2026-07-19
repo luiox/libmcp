@@ -39,3 +39,18 @@ framing 和本地状态错误仍使用 `McpError`。
 当前 session 只校验 initialize 中 client capabilities 的 object 形态，不持久化该 DOM，也不发起
 server-to-client request。后续引入 sampling/roots 等客户端能力时，应增加明确的拥有型 capability
 快照，而不是保存指向 initialize request arena 的视图。
+
+## tools registry
+
+`ToolDefinition` 持有完整 descriptor `JsonDocument`，而不是把不断演进的 Tool schema 展开成固定
+C++ struct。tools/list 构建响应时递归复制 JSON value，并把所有 key/string 重新 intern 到响应
+document arena，禁止跨 document 浅拷贝字符串引用。
+
+`ServerSession::install_tools` 接受 `shared_ptr<ToolRegistry>`，两个 method handler 捕获该所有权，
+不会依赖调用方栈对象寿命。安装后 registry 冻结并声明 `tools.listChanged=false`；动态目录及
+notifications/tools/list_changed 必须与 server-to-client notification 支持一起加入，不能只开放
+运行期写入。
+
+tool handler 接收只在回调期有效的 arguments object，返回拥有型 CallToolResult document。
+工具正常执行失败应使用 `isError=true`，只有协议参数错误与 handler 内部错误才使用
+`MethodError` 生成 JSON-RPC error response。

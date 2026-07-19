@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -11,6 +12,8 @@
 #include "mcp/stdio_transport.hpp"
 
 namespace mcp {
+
+class ToolRegistry;
 
 /// @brief JSON-RPC method handler 返回的协议错误。
 class MethodError
@@ -97,6 +100,10 @@ public:
 
     /// @brief 注册 ready 阶段的同步 request handler；重复或内建 method 返回错误。
     McpResult<void> register_method(std::string method, MethodHandler handler);
+
+    /// @brief 安装 tools/list 与 tools/call registry，并自动声明 tools capability。
+    /// @note 必须在 initialize 前调用；session 通过 shared_ptr 保持 registry 生命周期。
+    McpResult<void> install_tools(std::shared_ptr<ToolRegistry> registry);
 
     /// @brief 处理一条已校验 message；notification 或被忽略的 response 返回空 optional。
     McpResult<std::optional<JsonRpcMessage>> handle(const JsonRpcMessage& message);

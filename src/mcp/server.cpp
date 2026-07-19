@@ -1,5 +1,7 @@
 #include "mcp/server.hpp"
 
+#include "mcp/tool_registry.hpp"
+
 #include <utility>
 
 #include <libca/str/utf8_util.hpp>
@@ -152,6 +154,31 @@ McpResult<void> ServerSession::register_method(std::string method, MethodHandler
         return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidState,
                                                  "MCP method is already registered: " + method));
     handlers_.emplace(std::move(method), std::move(handler));
+    return ca::core::Ok();
+}
+
+McpResult<void> ServerSession::install_tools(std::shared_ptr<ToolRegistry> registry)
+{
+    if (registry == nullptr)
+        return ca::core::Err(
+            McpError::from_kind(McpErrorKind::InvalidState, "MCP tool registry must not be null"));
+    if (state_ != ServerSessionState::AwaitingInitialize)
+        return ca::core::Err(McpError::from_kind(
+            McpErrorKind::InvalidState, "MCP tool registry must be installed before initialize"));
+    if (handlers_.find("tools/list") != handlers_.end() ||
+        handlers_.find("tools/call") != handlers_.end())
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidState,
+                                                 "MCP tools methods are already registered"));
+
+    registry->freeze();
+    handlers_.emplace("tools/list", [registry](const JsonRpcMessage& request) {
+        return registry->handle_list(request);
+    });
+    handlers_.emplace("tools/call", [registry](const JsonRpcMessage& request) {
+        return registry->handle_call(request);
+    });
+    options_.capabilities.tools              = true;
+    options_.capabilities.tools_list_changed = false;
     return ca::core::Ok();
 }
 

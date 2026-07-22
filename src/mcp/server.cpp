@@ -243,7 +243,20 @@ McpResult<void> ServerSession::serve_stdio(StdioTransport& transport)
         auto outbound = std::move(response).unwrap();
         if (!outbound.has_value()) continue;
         auto written = transport.write_message(*outbound);
-        if (written.is_err()) return ca::core::Err(std::move(written).unwrap_err());
+        if (written.is_ok()) continue;
+
+        auto write_error = std::move(written).unwrap_err();
+        if (write_error.kind() != McpErrorKind::MessageTooLarge)
+            return ca::core::Err(std::move(write_error));
+
+        auto fallback =
+            JsonRpcMessage::make_error(message->copy_id(),
+                                       JSON_RPC_INTERNAL_ERROR,
+                                       "JSON-RPC response exceeds stdio transport message limit");
+        if (fallback.is_err()) return ca::core::Err(std::move(fallback).unwrap_err());
+        auto fallback_written = transport.write_message(std::move(fallback).unwrap());
+        if (fallback_written.is_err())
+            return ca::core::Err(std::move(fallback_written).unwrap_err());
     }
 }
 

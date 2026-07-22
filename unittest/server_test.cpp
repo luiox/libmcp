@@ -233,6 +233,96 @@ TEST(ServerSessionTest, ServesRecoverableParseErrorsAndRequestsOverStdio)
     EXPECT_TRUE(pong.result()->is_object());
 }
 
+TEST(ServerSessionTest, ReplacesOversizedStdioResponseAndContinuesServing)
+{
+    auto server = make_server();
+    ASSERT_TRUE(server
+                    .register_method(
+                        "large-result",
+                        [](const JsonRpcMessage&) -> MethodResult {
+                            ca::json::JsonDocument document;
+                            auto                   result = ca::json::JsonValue::make_object();
+                            const std::string      value(2048, 'x');
+                            result.set(
+                                document.arena().intern("value"),
+                                ca::json::JsonValue::make_string(document.arena().intern(
+                                    reinterpret_cast<const ca::u8*>(value.data()), value.size())));
+                            document.root() = std::move(result);
+                            return ca::core::Ok(std::move(document));
+                        })
+                    .is_ok());
+    initialize(server);
+
+    MemoryReader          reader("{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"large-result\"}\n"
+                                 "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"ping\"}\n");
+    MemoryWriter          writer;
+    StdioTransportOptions options;
+    options.max_message_bytes = 256;
+    auto transport_result     = StdioTransport::create(reader, writer, options);
+    ASSERT_TRUE(transport_result.is_ok());
+    auto transport = std::move(transport_result).unwrap();
+
+    auto served = server.serve_stdio(transport);
+    ASSERT_TRUE(served.is_ok()) << served.unwrap_err().to_string();
+
+    const auto first_end = writer.output().find('\n');
+    ASSERT_NE(first_end, std::string::npos);
+    auto first = JsonRpcMessage::parse(ca::str::Utf8StringRef::from_string_view(
+        std::string_view(writer.output().data(), first_end)));
+    ASSERT_TRUE(first.is_ok());
+    auto oversized = std::move(first).unwrap();
+    EXPECT_EQ(error_code(oversized), -32603);
+    ASSERT_TRUE(oversized.copy_id().has_value());
+    EXPECT_EQ(77, *oversized.copy_id()->integer_value());
+    EXPECT_NE(std::string::npos,
+              member(*oversized.error(), "message")->as_string().to_std_string().find("exceeds"));
+
+    const auto second_start = first_end + 1;
+    const auto second_end   = writer.output().find('\n', second_start);
+    ASSERT_NE(second_end, std::string::npos);
+    auto second = JsonRpcMessage::parse(ca::str::Utf8StringRef::from_string_view(
+        std::string_view(writer.output().data() + second_start, second_end - second_start)));
+    ASSERT_TRUE(second.is_ok());
+    auto pong = std::move(second).unwrap();
+    ASSERT_NE(pong.result(), nullptr);
+    ASSERT_TRUE(pong.copy_id().has_value());
+    EXPECT_EQ(78, *pong.copy_id()->integer_value());
+}
+
+TEST(ServerSessionTest, StopsWhenOversizedStdioFallbackCannotBeWritten)
+{
+    auto server = make_server();
+    ASSERT_TRUE(server
+                    .register_method(
+                        "large-result",
+                        [](const JsonRpcMessage&) -> MethodResult {
+                            ca::json::JsonDocument document;
+                            auto                   result = ca::json::JsonValue::make_object();
+                            const std::string      value(2048, 'x');
+                            result.set(
+                                document.arena().intern("value"),
+                                ca::json::JsonValue::make_string(document.arena().intern(
+                                    reinterpret_cast<const ca::u8*>(value.data()), value.size())));
+                            document.root() = std::move(result);
+                            return ca::core::Ok(std::move(document));
+                        })
+                    .is_ok());
+    initialize(server);
+
+    MemoryReader          reader("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"large-result\"}\n");
+    MemoryWriter          writer;
+    StdioTransportOptions options;
+    options.max_message_bytes = 64;
+    auto transport_result     = StdioTransport::create(reader, writer, options);
+    ASSERT_TRUE(transport_result.is_ok());
+    auto transport = std::move(transport_result).unwrap();
+
+    auto served = server.serve_stdio(transport);
+    ASSERT_TRUE(served.is_err());
+    EXPECT_EQ(McpErrorKind::MessageTooLarge, served.unwrap_err().kind());
+    EXPECT_TRUE(writer.output().empty());
+}
+
 TEST(ServerSessionTest, RejectsInvalidConfigurationAndBuiltInRegistration)
 {
     ServerOptions invalid;

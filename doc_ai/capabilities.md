@@ -22,6 +22,8 @@
 - ready 后把 request 分发给同步 method handler，并生成标准 method not found、invalid params
   和 internal error response。
 - stdio server loop 把可恢复的 JSON/JSON-RPC 单行错误转换为协议 error response。
+- handler 结果超过 stdio message 上限时，server loop 使用原 request id 返回精简 `-32603`
+  JSON-RPC error，并继续处理后续消息；仅当精简错误也无法写出或底层 IO 失败时终止会话。
 
 ## tools
 

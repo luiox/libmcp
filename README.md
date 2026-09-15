@@ -21,6 +21,12 @@ Streamable HTTP 的独立 GET stream、server-initiated request、HTTPS 和 reso
 feature registry 将在后续增量加入。
 MCP wire format 使用 JSON-RPC，不需要 XML。
 
+## 状态与免责声明
+
+- **代码由 AI 生成**，优先服务于作者个人项目；pre-1.0 阶段**不提供任何 API 兼容性 / 稳定性 / 可用性保证**，任何版本都可能引入破坏性变更。
+- 本库按「现状」提供，是否用于生产环境请自行评估（完整免责条款见 [LICENSE](LICENSE)）。
+- Issue 欢迎提，但**不承诺任何响应时效**：作者看到后会安排 AI 统一分诊处理，可能很快也可能长期搁置；feature 请求是否接受以作者自身项目需求为准。
+
 ## 构建（本仓库自构建）
 
 依赖 [libca](https://github.com/luiox/libca)（经 [luiox-repo](https://github.com/luiox/luiox-repo)

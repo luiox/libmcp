@@ -19,7 +19,7 @@ target("libmcp")
     set_kind("static")
     add_packages("libca", {public = true})
     add_files("src/mcp/*.cpp")
-    add_headerfiles("src/mcp/**.hpp")
+    add_headerfiles("src/(mcp/**.hpp)")
     add_includedirs("src", {public = true})
 
     if is_plat("windows") then

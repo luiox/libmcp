@@ -1,0 +1,84 @@
+# libmcp CI（Linux + Windows）
+#
+# 范围：libmcp 静态库 + libmcp_unittest（gtest，受 with_tests 开关守护）。
+#
+# 依赖链路：libca 0.0.7 经 root xmake.lua 的 add_repositories(luiox-repo) 从
+# github.com/luiox/luiox-repo 拉取包定义，再由 xrepo git 直连克隆
+# github.com/luiox/libca 源码构建。因此本 CI 同时充当「公开包链路」的
+# 端到端验证：任何一个定义/版本/依赖环节断了，这里最先红。
+#
+# 注：
+# - 不含 mingw 前端：libca 包定义 on_install 未覆盖 mingw（与 libca 核心仓
+#   的 mingw job 不同，包安装路径当前只支持 msvc/linux/macox 工具链）。
+# - macOS 待包链路在 arm64 上实际验证后再加。
+
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "xmake.lua"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "xmake.lua"
+      - ".github/workflows/ci.yml"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            plat: linux
+            arch: x64
+            xrepo_pkg_path: ~/.xmake/packages
+          - os: windows-latest
+            plat: windows
+            arch: x64
+            xrepo_pkg_path: ~/AppData/Local/.xmake/packages
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (linux)
+        if: matrix.os == 'ubuntu-latest'
+        # cmake/ninja：xrepo 源码编译 gtest 需要。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: v3.0.9
+          actions-cache-folder: '.xmake-cache'
+
+      - name: Cache xrepo packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.xrepo_pkg_path }}
+          key: libmcp-xrepo-${{ matrix.os }}-x64-xmake309-${{ hashFiles('xmake.lua') }}
+          restore-keys: |
+            libmcp-xrepo-${{ matrix.os }}-x64-xmake309-
+
+      - name: Configure (with tests)
+        # -y：xrepo 安装包的交互确认自动通过。
+        run: xmake f -p ${{ matrix.plat }} -a ${{ matrix.arch }} --with_tests=y -y
+
+      - name: Build
+        run: xmake build libmcp libmcp_unittest
+
+      - name: Run unit tests
+        run: xmake run libmcp_unittest

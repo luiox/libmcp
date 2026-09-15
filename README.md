@@ -1,46 +1,20 @@
-# libmcp
+# libmcp [![CI](https://github.com/luiox/libmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/luiox/libmcp/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-`libmcp` 是建立在 libca JSON、IO、net/http 之上的 C++17 MCP（Model Context
-Protocol，JSON-RPC 2.0）基础库。自 [morpher](https://github.com/luiox) 单体仓
-`libs/libmcp` 拆分而来（git subtree split 保留完整提交历史）。
+C++17 的 MCP（Model Context Protocol）服务端基础库：stdio 与 Streamable HTTP 传输、工具注册与分发，构建于 [libca](https://github.com/luiox/libca) 之上。
 
-当前增量提供：
+## 特性
 
-- 严格的单条 MCP JSON-RPC 2.0 message 解析与结构校验。
-- request/notification/result/error 的拥有型出站构造。
-- 拥有 `JsonDocument` 的 message 生命周期边界。
-- 符合 MCP 2025-11-25 的 newline-delimited stdio transport。
-- UTF-8、message 大小、EOF 和底层 IO 错误处理。
-- 服务端 initialize/initialized/ready 生命周期、版本协商、ping 与同步 method 分发。
-- 可直接运行至 EOF 且能恢复单行 JSON 错误的 stdio server loop。
-- 拥有完整 descriptor 的静态 tool registry，以及 tools/list、tools/call 分发。
-- 基于 libca HTTP/net 的 Streamable HTTP server、可选 SSE response 与 Last-Event-ID 重放、
-  Origin allowlist、authorization hook 与并发 session 管理。
+* 单条 MCP JSON-RPC 2.0 message 的严格解析与结构校验
+* stdio transport（MCP 2025-11-25，newline-delimited），可运行至 EOF 并恢复单行 JSON 错误
+* 服务端 initialize/initialized 生命周期、协议版本协商、ping 与同步 method 分发
+* 静态 tool registry：完整 descriptor 校验、`tools/list`、`tools/call` 分发
+* Streamable HTTP server：可选 SSE、Last-Event-ID 重放、Origin allowlist、authorization hook、并发 session
 
-Streamable HTTP 的独立 GET stream、server-initiated request、HTTPS 和 resources/prompts
-feature registry 将在后续增量加入。
-MCP wire format 使用 JSON-RPC，不需要 XML。
+## 使用
 
-## 状态与免责声明
+### 接入
 
-- **代码由 AI 生成**，优先服务于作者个人项目；pre-1.0 阶段**不提供任何 API 兼容性 / 稳定性 / 可用性保证**，任何版本都可能引入破坏性变更。
-- 本库按「现状」提供，是否用于生产环境请自行评估（完整免责条款见 [LICENSE](LICENSE)）。
-- Issue 欢迎提，但**不承诺任何响应时效**：作者看到后会安排 AI 统一分诊处理，可能很快也可能长期搁置；feature 请求是否接受以作者自身项目需求为准。
-
-## 构建（本仓库自构建）
-
-依赖 [libca](https://github.com/luiox/libca)（经 [luiox-repo](https://github.com/luiox/luiox-repo)
-包定义仓拉取，首次配置自动克隆）与 xmake ≥ 2.8.3：
-
-```sh
-xmake f -p windows -a x64 --with_tests=y -y   # 配置（带单测）
-xmake -y                                       # 构建
-xmake run -y libmcp_unittest                   # 运行全部单测
-```
-
-不配置 `--with_tests=y` 时只构建 `libmcp` 静态库本体。
-
-## 作为包消费
+xmake ≥ 2.8.3，包定义来自 [luiox-repo](https://github.com/luiox/luiox-repo)：
 
 ```lua
 add_repositories("luiox-repo https://github.com/luiox/luiox-repo.git")
@@ -48,8 +22,72 @@ add_requires("libmcp 0.0.2")
 
 target("app")
     set_kind("binary")
+    add_files("src/*.cpp")
     add_packages("libmcp")
-    ...
 ```
 
-设计文档与能力清单见 `doc_ai/`。
+### 一个最小的 MCP server
+
+```cpp
+#include <mcp/mcp.hpp>
+
+// 工具回调：入参为 JSON arguments，返回 MCP result document
+static mcp::MethodResult echo(const ca::json::JsonValue& arguments) {
+    ca::json::JsonDocument document;
+    auto content_item = ca::json::JsonValue::make_object();
+    content_item.set(document.arena().intern("type"),
+                     ca::json::JsonValue::make_string(document.arena().intern("text")));
+    content_item.set(document.arena().intern("text"),
+                     ca::json::JsonValue::make_string(document.arena().intern("hello")));
+    auto content = ca::json::JsonValue::make_array();
+    content.append(std::move(content_item));
+    auto result = ca::json::JsonValue::make_object();
+    result.set(document.arena().intern("content"), std::move(content));
+    result.set(document.arena().intern("isError"), ca::json::JsonValue::make_bool(false));
+    document.root() = std::move(result);
+    return ca::core::Ok(std::move(document));
+}
+
+int main() {
+    mcp::ServerOptions options;
+    options.name    = "my-server";
+    options.version = "1.0.0";
+    options.capabilities.tools = true;
+
+    auto created = mcp::ServerSession::create(std::move(options));
+    if (created.is_err()) return 1;
+    auto server = std::move(created).unwrap();
+
+    // 注册工具：definition 为标准 MCP tool JSON（name/description/inputSchema）
+    auto registry = std::make_shared<mcp::ToolRegistry>();
+    auto tool = mcp::ToolDefinition::parse(ca::str::Utf8StringRef::from_cstr(
+        R"({"name":"echo","description":"Echo text","inputSchema":{"type":"object"}})"));
+    registry->register_tool(std::move(tool).unwrap(), echo);
+    server.install_tools(registry);
+
+    // stdio 传输：借用宿主的 stdin/stdout 字节流（libca io 的 native stream），
+    // serve 至 EOF；initialize / tools/list / tools/call 全部内部分发。
+    mcp::StdioTransport transport =
+        mcp::StdioTransport::create(reader, writer).unwrap();
+    return server.serve_stdio(transport).is_ok() ? 0 : 1;
+}
+```
+
+## 构建（本仓库开发）
+
+```bash
+xmake f -p windows -a x64 --with_tests=y -y   # Windows/MSVC
+xmake f -p linux --with_tests=y -y            # Linux
+xmake
+xmake run libmcp_unittest
+```
+
+## 说明
+
+* 本库**由 AI 生成**，优先服务于作者个人项目；pre-1.0 阶段无 API 兼容性与可用性保证，生产使用请自行评估（免责条款见 [LICENSE](LICENSE)）。
+* Issue 欢迎提：作者会安排 AI 分诊处理，但不承诺时效。
+* 设计文档与能力边界见 `doc_ai/`。
+
+## License
+
+[Apache-2.0](LICENSE) © Canrad

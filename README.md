@@ -44,7 +44,7 @@ xmake run -y libmcp_unittest                   # 运行全部单测
 
 ```lua
 add_repositories("luiox-repo https://github.com/luiox/luiox-repo.git")
-add_requires("libmcp 0.0.1")
+add_requires("libmcp 0.0.2")
 
 target("app")
     set_kind("binary")

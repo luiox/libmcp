@@ -78,7 +78,7 @@ jobs:
         run: xmake f -p ${{ matrix.plat }} -a ${{ matrix.arch }} --with_tests=y -y
 
       - name: Build
-        run: xmake build libmcp libmcp_unittest
+        run: xmake build libmcp_unittest
 
       - name: Run unit tests
         run: xmake run libmcp_unittest

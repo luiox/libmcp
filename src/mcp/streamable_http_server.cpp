@@ -154,7 +154,7 @@ ca::http::HttpResult<ca::http::HttpServerResponse> json_response(
     const auto encoded = message.serialize();
     return buffered_response(
         status,
-        std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
+        std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.byte_length()),
         "application/json",
         session_id);
 }
@@ -500,7 +500,7 @@ private:
 
         const auto encoded_message = message.serialize();
         const auto message_view    = std::string_view(
-            reinterpret_cast<const char*>(encoded_message.data()), encoded_message.size());
+            reinterpret_cast<const char*>(encoded_message.data()), encoded_message.byte_length());
         const auto stream_id = std::to_string(record.next_stream_id++);
         auto       stream    = std::make_shared<SseReplayStream>();
         stream->events.reserve(2);

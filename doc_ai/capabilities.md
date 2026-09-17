@@ -16,14 +16,35 @@
 
 ## server session
 
-- 执行 initialize、initialized notification 与 ready 状态迁移。
-- 按客户端请求选择支持的协议版本，声明 server identity 与基础 capabilities。
-- 在所有 lifecycle 阶段内建处理 ping。
-- ready 后把 request 分发给同步 method handler，并生成标准 method not found、invalid params
+- dual-era 单实例双语义：`server/discover` 免版本直接应答；`initialize` 进入 legacy lifecycle
+  状态机；其余 request 按 `params._meta` 是否携带 modern（2026-07-28）版本选择无状态路径或
+  legacy 会话路径（后者要求处于 Ready）。
+- legacy：执行 initialize、initialized notification 与 ready 状态迁移；按客户端请求选择支持的
+  协议版本，声明 server identity 与基础 capabilities；在所有 lifecycle 阶段内建处理 ping；
+  ready 后把 request 分发给同步 method handler，并生成标准 method not found、invalid params
   和 internal error response。
+- modern：不触碰 lifecycle 状态、可并发；请求版本不获支持时返回
+  UnsupportedProtocolVersionError（`-32022`，data 带 supported/requested）。
 - stdio server loop 把可恢复的 JSON/JSON-RPC 单行错误转换为协议 error response。
 - handler 结果超过 stdio message 上限时，server loop 使用原 request id 返回精简 `-32603`
   JSON-RPC error，并继续处理后续消息；仅当精简错误也无法写出或底层 IO 失败时终止会话。
+
+## modern era（2026-07-28）
+
+- 无状态分派：每请求以 `params._meta["io.modelcontextprotocol/protocolVersion"]` 声明协议
+  版本，不经 initialize/session，不改变 lifecycle 状态。
+- `server/discover` 探测：免版本校验直接应答，返回 supportedVersions 与 server
+  identity/capabilities。
+- 错误形状：版本不获支持返回 `-32022`（data 携带 supported/requested）；Streamable HTTP 上
+  `MCP-Protocol-Version` 头与 `_meta` 版本同时存在且不一致时返回 `-32020`（HTTP 层构造，
+  id 取请求 id）。
+- resultType 信封：modern 结果携带 `resultType`（普通完成为 `complete`）；legacy 结果永不
+  添加。
+- tools/list 确定性顺序，并在 `_meta` 附带 `ttlMs` 缓存新鲜度提示与 cacheScope（默认
+  private，可配置 public）。
+- HTTP 双模路由：无 `MCP-Session-Id` 的非 initialize POST 走共享 ServerSession 实例
+  （注册先行即可并发），不创建 session、不占 session 上限、不返回 `MCP-Session-Id`；
+  仅携带 `MCP-Protocol-Version` 头的请求由 HTTP 层把版本写入 `_meta` 后转交。
 
 ## tools
 
@@ -52,10 +73,17 @@
   限制 replay stream 数与编码字节数。
 - GET 携带 `Last-Event-ID` 时只重放该 event 所属 stream 的后续事件；未知或已淘汰 cursor
   返回 404，普通 GET 仍返回 405。
+- dual-era 双模路由：无 `MCP-Session-Id` 的非 initialize POST 走 modern 无状态路径
+  （见 modern era 一节）；Origin allowlist、JSON Content-Type 与 JSON/SSE Accept 校验
+  先于路由执行，对 modern 路径同样生效；modern 响应恒为 buffered `application/json`，
+  不走 SSE。
 
 ## 尚未实现
 
 - resource/prompt registry 与 dispatcher。
-- Streamable HTTP 独立 GET stream 与 session expiry。
+- subscriptions/listen 与 resource 更新订阅。
+- MRTR 仅 resultType 信封透传，无 inputRequests 语义层。
+- `Mcp-Method`/`Mcp-Name` 请求头未强制校验。
+- Streamable HTTP 独立 GET stream 与 session expiry（legacy）。
 - HTTPS 与 proxy-aware public origin policy。
 - client capability 的持久化与 server-initiated request。

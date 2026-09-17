@@ -10,6 +10,36 @@ C++17 的 MCP（Model Context Protocol）服务端基础库：stdio 与 Streamab
 * 静态 tool registry：完整 descriptor 校验、`tools/list`、`tools/call` 分发
 * Streamable HTTP server：可选 SSE、Last-Event-ID 重放、Origin allowlist、authorization hook、并发 session
 
+### dual-era 双协议
+
+同一 Streamable HTTP endpoint 可并发服务 MCP 2026-07-28（modern）与 2025-11-25（legacy）
+两代客户端：
+
+* **modern 无状态路径**：不带 `MCP-Session-Id` 的非 initialize 请求按 2026-07-28 语义服务。
+  版本由每请求 `params._meta["io.modelcontextprotocol/protocolVersion"]` 声明（HTTP 上可改为
+  仅携带 `MCP-Protocol-Version` 头，两者同时存在且不一致时返回 `-32020`）。`server/discover`
+  免版本直接应答；modern 结果携带 `resultType` 信封，列表结果附 `ttlMs` 缓存新鲜度提示。
+  modern 请求不创建 session、不占 session 上限，响应恒为 buffered `application/json`。
+* **legacy 完整保留**：`initialize` 仍创建 session 并返回 `MCP-Session-Id`，后续请求经
+  session 串行处理，支持 SSE 重放、`MCP-Protocol-Version` 校验与 ping；legacy 结果不添加
+  modern 信封字段。
+
+`server/discover` 响应示例：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "serverInfo": {"name": "my-server", "version": "1.0.0"},
+    "capabilities": {"tools": {"listChanged": false}},
+    "_meta": {"ttlMs": 300000}
+  }
+}
+```
+
 ## 使用
 
 ### 接入
@@ -18,7 +48,7 @@ xmake ≥ 2.8.3，包定义来自 [luiox-repo](https://github.com/luiox/luiox-re
 
 ```lua
 add_repositories("luiox-repo https://github.com/luiox/luiox-repo.git")
-add_requires("libmcp 0.0.2")
+add_requires("libmcp 0.1.0")
 
 target("app")
     set_kind("binary")

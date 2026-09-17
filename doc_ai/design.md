@@ -54,6 +54,35 @@ factory；每个 session 的独立 mutex 保证来自多个 HTTP connection 的 
 factory 或 session handler 的异常会转换为 HTTP 500；初始化失败释放容量预留，已有 session 的
 不可恢复错误会先标记失效再从目录移除，避免后续请求继续进入可能损坏的状态。
 
+## dual-era 双协议设计
+
+MCP 2026-07-28 移除了 initialize 握手与 session：每个请求以
+`params._meta["io.modelcontextprotocol/protocolVersion"]` 携带协议版本，HTTP 上并行携带
+`MCP-Protocol-Version` 头。libmcp 允许同一 Streamable HTTP endpoint 并发服务两代客户端。
+
+分派规则（`ServerSession::handle` 内部，按序判定）：
+
+1. `server/discover` 免版本校验，直接以 modern 语义应答；
+2. `initialize` 选择 legacy 语义，进入 lifecycle 状态机；
+3. `_meta` 携带 modern 版本 → modern 无状态路径，版本不获支持返回 `-32022`
+   （data 携带 supported/requested）；
+4. 无版本且实例处于 Ready → legacy 会话路径；
+5. 其余 → `-32022`。
+
+HTTP 层只做 header/_meta 一致性检查：两者同时存在且值不同时直接构造 `-32020` JSON-RPC
+error（id 取请求 id），不进入 server；仅 header 声明版本时由 HTTP 层把版本写入 `_meta`
+再转交（server 看不到 HTTP 头）。无 session id 的 `initialize` 在 HTTP 层拦截并走 legacy
+建 session 路径，永不进入共享实例——否则任一客户端都能把共享实例推进 legacy 状态机。
+
+线程模型：modern 请求共享同一 `ServerSession` 实例并发进入，不触碰 lifecycle 可变状态，
+前提是全部 method/registry 注册在 HTTP 服务开始前完成；legacy 每 session 一把互斥锁串行，
+不同 session 相互独立。session 目录与容量预留由全局 mutex 保护；session 总数上限只统计
+legacy session，modern 请求不占名额。
+
+兼容红线：legacy（initialize 协商）结果永不添加 `resultType`/`ttlMs` 等 modern 信封字段；
+modern 响应恒为 buffered `application/json`，不走 SSE、无 event id、不返回
+`MCP-Session-Id`；notification 沿用 202 语义。
+
 ## server session
 
 `ServerSession` 对应一个 client connection，状态严格按 `AwaitingInitialize`、

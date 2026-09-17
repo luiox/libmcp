@@ -1,5 +1,5 @@
 set_project("libmcp")
-set_version("0.0.2")
+set_version("0.1.0")
 set_xmakever("2.8.3")
 
 add_rules("mode.debug", "mode.release")

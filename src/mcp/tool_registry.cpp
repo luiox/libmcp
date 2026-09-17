@@ -1,5 +1,6 @@
 #include "mcp/tool_registry.hpp"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -166,10 +167,18 @@ MethodResult ToolRegistry::handle_list(const JsonRpcMessage& request) const
         return ca::core::Err(
             MethodError::invalid_params("tools/list pagination cursor is not supported"));
 
+    // 2026-07-28 规范 SHOULD：tools 数组按 name 字典序输出，保证输出确定性；
+    // 登记顺序（entries_）保持不变，仅在构造响应时排序。
+    std::vector<const Entry*> ordered;
+    ordered.reserve(entries_.size());
+    for (const auto& entry : entries_) ordered.push_back(&entry);
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Entry* lhs, const Entry* rhs) { return lhs->name < rhs->name; });
+
     JsonDocument result;
     JsonValue    tools = JsonValue::make_array();
-    for (const auto& entry : entries_)
-        tools.append(clone_value(result, entry.definition.document().root()));
+    for (const auto* entry : ordered)
+        tools.append(clone_value(result, entry->definition.document().root()));
     JsonValue root = JsonValue::make_object();
     root.set(result.arena().intern("tools"), std::move(tools));
     result.root() = std::move(root);

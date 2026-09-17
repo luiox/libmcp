@@ -61,7 +61,7 @@ ServerSession make_server()
     options.name                                = "libmcp-test";
     options.version                             = "1.0.0";
     options.title                               = "libmcp test server";
-    options.supported_protocol_versions         = {"2025-11-25", "2025-03-26"};
+    options.legacy_protocol_versions           = {"2025-11-25", "2025-03-26"};
     options.capabilities.tools                  = true;
     options.capabilities.tools_list_changed     = true;
     options.capabilities.resources              = true;
@@ -338,6 +338,210 @@ TEST(ServerSessionTest, RejectsInvalidConfigurationAndBuiltInRegistration)
                                      })
                     .is_err());
     EXPECT_TRUE(server.register_method("unused", MethodHandler()).is_err());
+}
+
+// ── MCP 2026-07-28 modern（无状态 per-request `_meta`）套件 ──────────────────
+
+TEST(ModernEraTest, ModernRequestServedStatelessly)
+{
+    auto server = make_server();
+    ASSERT_TRUE(server
+                    .register_method("tools/list",
+                                     [](const JsonRpcMessage&) -> MethodResult {
+                                         ca::json::JsonDocument document;
+                                         ca::json::JsonValue    root =
+                                             ca::json::JsonValue::make_object();
+                                         root.set(document.arena().intern("tools"),
+                                                  ca::json::JsonValue::make_array());
+                                         document.root() = std::move(root);
+                                         return ca::core::Ok(std::move(document));
+                                     })
+                    .is_ok());
+
+    auto request = parse_message(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}})");
+    auto response = take_response(server.handle(request));
+    ASSERT_NE(response.result(), nullptr);
+    const auto* result_type = member(*response.result(), "resultType");
+    ASSERT_NE(result_type, nullptr);
+    EXPECT_EQ(result_type->as_string(), "complete");
+    const auto* ttl = member(*response.result(), "ttlMs");
+    ASSERT_NE(ttl, nullptr);
+    EXPECT_EQ(ttl->as_int(), 300000);
+    EXPECT_EQ(server.state(), ServerSessionState::AwaitingInitialize);
+}
+
+TEST(ModernEraTest, DiscoverProbe)
+{
+    auto server = make_server();
+    auto request = parse_message(
+        R"({"jsonrpc":"2.0","id":"d1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}})");
+    auto response = take_response(server.handle(request));
+    ASSERT_NE(response.result(), nullptr);
+    const auto& result      = *response.result();
+    const auto* result_type = member(result, "resultType");
+    ASSERT_NE(result_type, nullptr);
+    EXPECT_EQ(result_type->as_string(), "complete");
+
+    const auto* versions = member(result, "supportedVersions");
+    ASSERT_NE(versions, nullptr);
+    ASSERT_TRUE(versions->is_array());
+    ASSERT_EQ(versions->size(), static_cast<ca::usize>(3));
+    EXPECT_EQ(versions->at(0).as_string(), "2026-07-28");
+    EXPECT_EQ(versions->at(1).as_string(), "2025-11-25");
+    EXPECT_EQ(versions->at(2).as_string(), "2025-03-26");
+
+    const auto* capabilities = member(result, "capabilities");
+    ASSERT_NE(capabilities, nullptr);
+    EXPECT_NE(member(*capabilities, "tools"), nullptr);
+
+    const auto* meta        = member(result, "_meta");
+    ASSERT_NE(meta, nullptr);
+    const auto* server_info = member(*meta, "io.modelcontextprotocol/serverInfo");
+    ASSERT_NE(server_info, nullptr);
+    EXPECT_EQ(member(*server_info, "name")->as_string(), "libmcp-test");
+    EXPECT_EQ(member(*server_info, "version")->as_string(), "1.0.0");
+
+    const auto* ttl = member(result, "ttlMs");
+    ASSERT_NE(ttl, nullptr);
+    EXPECT_EQ(ttl->as_int(), 300000);
+    const auto* cache_scope = member(result, "cacheScope");
+    ASSERT_NE(cache_scope, nullptr);
+    EXPECT_EQ(cache_scope->as_string(), "private");
+}
+
+TEST(ModernEraTest, DiscoverWithoutMetaVersion)
+{
+    auto server   = make_server();
+    auto request  = parse_message(R"({"jsonrpc":"2.0","id":2,"method":"server/discover"})");
+    auto response = take_response(server.handle(request));
+    ASSERT_NE(response.result(), nullptr);
+    const auto* result_type = member(*response.result(), "resultType");
+    ASSERT_NE(result_type, nullptr);
+    EXPECT_EQ(result_type->as_string(), "complete");
+    EXPECT_NE(member(*response.result(), "supportedVersions"), nullptr);
+}
+
+TEST(ModernEraTest, UnsupportedVersionErrorShape)
+{
+    auto server = make_server();
+    auto request = parse_message(
+        R"({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}})");
+    auto response = take_response(server.handle(request));
+    EXPECT_EQ(error_code(response), -32022);
+    const auto* error = response.error();
+    ASSERT_NE(error, nullptr);
+    const auto* data = member(*error, "data");
+    ASSERT_NE(data, nullptr);
+    const auto* supported = member(*data, "supported");
+    ASSERT_NE(supported, nullptr);
+    ASSERT_TRUE(supported->is_array());
+    ASSERT_EQ(supported->size(), static_cast<ca::usize>(1));
+    EXPECT_EQ(supported->at(0).as_string(), "2026-07-28");
+    const auto* requested = member(*data, "requested");
+    ASSERT_NE(requested, nullptr);
+    EXPECT_EQ(requested->as_string(), "1900-01-01");
+}
+
+TEST(ModernEraTest, MissingVersionWithoutLegacySession)
+{
+    auto server   = make_server();
+    auto request  = parse_message(R"({"jsonrpc":"2.0","id":4,"method":"tools/list"})");
+    auto response = take_response(server.handle(request));
+    EXPECT_EQ(error_code(response), -32022);
+    const auto* data = member(*response.error(), "data");
+    ASSERT_NE(data, nullptr);
+    const auto* requested = member(*data, "requested");
+    ASSERT_NE(requested, nullptr);
+    EXPECT_TRUE(requested->is_null());
+    const auto* supported = member(*data, "supported");
+    ASSERT_NE(supported, nullptr);
+    EXPECT_EQ(supported->at(0).as_string(), "2026-07-28");
+}
+
+TEST(ModernEraTest, LegacyFlowUnaffected)
+{
+    auto server = make_server();
+    ASSERT_TRUE(server
+                    .register_method("tools/list",
+                                     [](const JsonRpcMessage&) -> MethodResult {
+                                         ca::json::JsonDocument document;
+                                         ca::json::JsonValue    root =
+                                             ca::json::JsonValue::make_object();
+                                         root.set(document.arena().intern("tools"),
+                                                  ca::json::JsonValue::make_array());
+                                         document.root() = std::move(root);
+                                         return ca::core::Ok(std::move(document));
+                                     })
+                    .is_ok());
+    initialize(server);
+
+    auto request  = parse_message(R"({"jsonrpc":"2.0","id":5,"method":"tools/list"})");
+    auto response = take_response(server.handle(request));
+    ASSERT_NE(response.result(), nullptr);
+    EXPECT_EQ(member(*response.result(), "resultType"), nullptr);
+    EXPECT_EQ(member(*response.result(), "ttlMs"), nullptr);
+    EXPECT_EQ(member(*response.result(), "_meta"), nullptr);
+}
+
+TEST(ModernEraTest, ResultTypePassthrough)
+{
+    auto server = make_server();
+    ASSERT_TRUE(server
+                    .register_method("tools/list",
+                                     [](const JsonRpcMessage&) -> MethodResult {
+                                         ca::json::JsonDocument document;
+                                         ca::json::JsonValue    root =
+                                             ca::json::JsonValue::make_object();
+                                         root.set(document.arena().intern("tools"),
+                                                  ca::json::JsonValue::make_array());
+                                         root.set(document.arena().intern("resultType"),
+                                                  ca::json::JsonValue::make_string(
+                                                      document.arena().intern("input_required")));
+                                         document.root() = std::move(root);
+                                         return ca::core::Ok(std::move(document));
+                                     })
+                    .is_ok());
+
+    auto request = parse_message(
+        R"({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}})");
+    auto response = take_response(server.handle(request));
+    ASSERT_NE(response.result(), nullptr);
+    const auto* result_type = member(*response.result(), "resultType");
+    ASSERT_NE(result_type, nullptr);
+    EXPECT_EQ(result_type->as_string(), "input_required");
+}
+
+TEST(ModernEraTest, AttachServerInfoToggle)
+{
+    ServerOptions options;
+    options.name               = "libmcp-test";
+    options.version            = "1.0.0";
+    options.attach_server_info = false;
+    options.capabilities.tools = true;
+    auto server_result         = ServerSession::create(std::move(options));
+    ASSERT_TRUE(server_result.is_ok());
+    auto server = std::move(server_result).unwrap();
+    ASSERT_TRUE(server
+                    .register_method("echo",
+                                     [](const JsonRpcMessage&) -> MethodResult {
+                                         ca::json::JsonDocument document;
+                                         ca::json::JsonValue    root =
+                                             ca::json::JsonValue::make_object();
+                                         root.set(document.arena().intern("ok"),
+                                                  ca::json::JsonValue::make_bool(true));
+                                         document.root() = std::move(root);
+                                         return ca::core::Ok(std::move(document));
+                                     })
+                    .is_ok());
+
+    auto request = parse_message(
+        R"({"jsonrpc":"2.0","id":7,"method":"echo","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}})");
+    auto response = take_response(server.handle(request));
+    ASSERT_NE(response.result(), nullptr);
+    const auto* meta = member(*response.result(), "_meta");
+    if (meta == nullptr) return;
+    EXPECT_EQ(member(*meta, "io.modelcontextprotocol/serverInfo"), nullptr);
 }
 
 }   // namespace mcp::test

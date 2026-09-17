@@ -122,6 +122,58 @@ std::optional<std::string_view> single_header(const ca::http::HttpHeaders& heade
     return values.front();
 }
 
+const ca::json::JsonValue* object_member(const ca::json::JsonValue& object, const char* name)
+{
+    if (!object.is_object()) return nullptr;
+    return object.find(ca::str::Utf8StringRef::from_cstr(name));
+}
+
+/// @brief 读取 request/notification `params._meta` 内声明的 modern 协议版本。
+std::optional<std::string> meta_protocol_version(const JsonRpcMessage& message)
+{
+    const auto* params = message.params();
+    if (params == nullptr) return std::nullopt;
+    const auto* meta = object_member(*params, "_meta");
+    if (meta == nullptr) return std::nullopt;
+    const auto* version = object_member(*meta, kMetaProtocolVersion);
+    if (version == nullptr || !version->is_string()) return std::nullopt;
+    return version->as_string().to_std_string();
+}
+
+/// @brief 重建 message 并把 header 解析出的协议版本写入 `params._meta`，供 server 层
+/// 白名单校验；HTTP 头不进入 server，modern 版本只能经 `_meta` 携带。
+McpResult<JsonRpcMessage> attach_meta_protocol_version(const JsonRpcMessage& message,
+                                                       const std::string&    version)
+{
+    auto reparsed = ca::json::JsonReader::read(message.serialize().ref());
+    if (reparsed.is_err())
+        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidJson,
+                                                 "failed to re-encode MCP HTTP request body"));
+    auto       document = std::move(reparsed).unwrap();
+    auto&      root     = document.root();
+    const auto meta_key = document.arena().intern("_meta");
+    auto*      params   = root.find(ca::str::Utf8StringRef::from_cstr("params"));
+    if (params == nullptr) {
+        root.set(document.arena().intern("params"), ca::json::JsonValue::make_object());
+        params = root.find(ca::str::Utf8StringRef::from_cstr("params"));
+    }
+    if (params == nullptr)
+        return ca::core::Err(
+            McpError::from_kind(McpErrorKind::InvalidState, "failed to attach MCP params"));
+    auto* meta = params->find(meta_key);
+    if (meta == nullptr) {
+        params->set(meta_key, ca::json::JsonValue::make_object());
+        meta = params->find(meta_key);
+    }
+    if (meta == nullptr)
+        return ca::core::Err(
+            McpError::from_kind(McpErrorKind::InvalidState, "failed to attach MCP _meta"));
+    meta->set(document.arena().intern(kMetaProtocolVersion),
+              ca::json::JsonValue::make_string(document.arena().intern(
+                  reinterpret_cast<const ca::u8*>(version.data()), version.size())));
+    return JsonRpcMessage::from_document(std::move(document));
+}
+
 ca::http::HttpResult<ca::http::HttpServerResponse> buffered_response(
     ca::u16 status, std::string_view body = {}, std::string_view content_type = {},
     std::optional<std::string_view> session_id = std::nullopt)
@@ -159,10 +211,12 @@ ca::http::HttpResult<ca::http::HttpServerResponse> json_response(
         session_id);
 }
 
-ca::http::HttpResult<ca::http::HttpServerResponse> json_rpc_error(ca::u16 status, ca::i64 code,
-                                                                  const std::string& message)
+ca::http::HttpResult<ca::http::HttpServerResponse> json_rpc_error(ca::u16                  status,
+                                                                  std::optional<JsonRpcId> id,
+                                                                  ca::i64              code,
+                                                                  const std::string&   message)
 {
-    auto response = JsonRpcMessage::make_error(std::nullopt, code, message);
+    auto response = JsonRpcMessage::make_error(std::move(id), code, message);
     if (response.is_err())
         return ca::core::Err(ca::http::HttpError::from_kind(
             ca::http::HttpErrorKind::InvalidState, "failed to build MCP JSON-RPC error response"));
@@ -264,7 +318,7 @@ public:
             auto       error = std::move(parsed).unwrap_err();
             const auto code  = error.kind() == McpErrorKind::InvalidJson ? JSON_RPC_PARSE_ERROR
                                                                          : JSON_RPC_INVALID_REQUEST;
-            return json_rpc_error(400, code, error.message());
+            return json_rpc_error(400, std::nullopt, code, error.message());
         }
         auto message = std::move(parsed).unwrap();
 
@@ -272,8 +326,14 @@ public:
         auto       session_id = single_header(request.headers, SESSION_HEADER, repeated_session);
         const bool initialize = message.kind() == JsonRpcMessageKind::Request &&
                                 message.method().has_value() && *message.method() == "initialize";
-        if (!session_id.has_value() && !repeated_session && initialize)
-            return initialize_session(message, context, std::move(authorization_identity));
+        if (!session_id.has_value() && !repeated_session) {
+            if (initialize) {
+                if (!factory_)
+                    return text_response(400, "MCP legacy sessions are not supported\n");
+                return initialize_session(message, context, std::move(authorization_identity));
+            }
+            return handle_modern_post(message, request.headers);
+        }
         if (repeated_session) return text_response(400, "MCP-Session-Id must occur exactly once\n");
         if (!session_id.has_value() || session_id->empty())
             return text_response(400, "MCP-Session-Id is required\n");
@@ -607,6 +667,53 @@ private:
         --pending_sessions_;
     }
 
+    /// @brief modern（2026-07-28）无状态路径：版本一致性检查后交给共享 ServerSession。
+    /// @details 版本优先取 `params._meta`，缺失时取 `MCP-Protocol-Version` 请求头；两者同时
+    /// 存在且不同时返回 -32020 JSON-RPC error（不进 server）。仅 header 声明版本时由 HTTP 层
+    /// 写入 `_meta` 后转交，版本白名单与 -32022 由 server 层完成。响应恒为 buffered
+    /// application/json，不创建 session、不返回 `MCP-Session-Id`；notification 返回 202。
+    ca::http::HttpResult<ca::http::HttpServerResponse> handle_modern_post(
+        const JsonRpcMessage& message, const ca::http::HttpHeaders& headers)
+    {
+        if (options_.shared_server == nullptr)
+            return text_response(400, "MCP-Session-Id is required\n");
+
+        bool repeated_header = false;
+        auto header_version  = single_header(headers, PROTOCOL_VERSION_HEADER, repeated_header);
+        if (repeated_header)
+            return text_response(400, "MCP-Protocol-Version must occur exactly once\n");
+
+        auto meta_version = meta_protocol_version(message);
+        if (meta_version.has_value() && header_version.has_value() &&
+            *meta_version != *header_version) {
+            auto error = json_rpc_error(400,
+                                        message.copy_id(),
+                                        kHeaderMismatchError,
+                                        "MCP-Protocol-Version header does not match the _meta "
+                                        "protocol version");
+            if (error.is_err()) return ca::core::Err(std::move(error).unwrap_err());
+            return ca::core::Ok(std::move(error).unwrap());
+        }
+
+        std::optional<JsonRpcMessage> injected;
+        const JsonRpcMessage*         payload = &message;
+        if (header_version.has_value() && !meta_version.has_value() &&
+            (message.kind() == JsonRpcMessageKind::Request ||
+             message.kind() == JsonRpcMessageKind::Notification)) {
+            auto attached =
+                attach_meta_protocol_version(message, std::string(*header_version));
+            if (attached.is_err()) return text_response(500, "MCP request failed\n");
+            injected = std::move(attached).unwrap();
+            payload  = &*injected;
+        }
+
+        auto handled = handle_session(*options_.shared_server, *payload);
+        if (handled.is_err()) return text_response(500, "MCP request failed\n");
+        auto response = std::move(handled).unwrap();
+        if (!response.has_value()) return buffered_response(202);
+        return json_response(200, *response);
+    }
+
     ca::http::HttpResult<ca::http::HttpServerResponse> initialize_session(
         const JsonRpcMessage& message, const ca::http::HttpServerRequestContext& context,
         std::string authorization_identity)
@@ -732,9 +839,9 @@ StreamableHttpServer::StreamableHttpServer(std::shared_ptr<Impl> impl) noexcept
 McpResult<StreamableHttpServer> StreamableHttpServer::create(HttpSessionFactory          factory,
                                                              StreamableHttpServerOptions options)
 {
-    if (!factory)
-        return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidState,
-                                                 "MCP HTTP session factory must not be empty"));
+    if (!factory && options.shared_server == nullptr)
+        return ca::core::Err(McpError::from_kind(
+            McpErrorKind::InvalidState, "MCP HTTP requires a session factory or a shared server"));
     if (!valid_endpoint(options.endpoint))
         return ca::core::Err(McpError::from_kind(McpErrorKind::InvalidState,
                                                  "MCP HTTP endpoint must be an origin-form path"));

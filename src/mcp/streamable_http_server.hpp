@@ -84,19 +84,29 @@ struct StreamableHttpServerOptions
     std::string endpoint{"/mcp"};   ///< 单一 MCP origin-form endpoint。
     std::vector<std::string> allowed_origins;   ///< 允许的 Origin 精确值；空列表拒绝全部 Origin。
     HttpRequestAuthorizer authorizer;   ///< 可选的每 request authorization；空回调表示禁用。
+    /// @brief modern（2026-07-28 无状态请求）共享的 `ServerSession` 处理实例。
+    /// @note 与 session factory 至少配置其一，可同时配置（dual-era）。modern 请求在该实例上
+    /// 无状态处理：不创建 session、不占 `max_sessions` 名额、不返回 `MCP-Session-Id`。
+    /// 全部 method/registry 注册必须在 HTTP 服务开始前完成。
+    std::shared_ptr<ServerSession> shared_server;
     /// @brief 设置后使用带 event id 的 SSE 返回 JSON-RPC request response。
     /// @note HTTP/1.0 自动回退 application/json；GET 仅用于携带 Last-Event-ID 重放已终止
-    /// stream，不开放独立消息 stream。
+    /// stream，不开放独立消息 stream。modern 路径不使用 SSE，恒为 buffered application/json。
     std::optional<StreamableHttpSseOptions> sse;
-    ca::usize max_sessions{1024};   ///< 同时保留的 session 上限。
+    ca::usize max_sessions{1024};   ///< 同时保留的 legacy session 上限；modern 请求不占名额。
     ca::usize session_id_bytes{32};   ///< 安全随机 session id 的原始字节数，范围 16-64。
-    bool require_protocol_version_header{true};   ///< 后续请求是否强制携带协商版本。
+    bool require_protocol_version_header{true};   ///< legacy 会话请求是否强制携带协商版本。
 };
 
-/// @brief 将独立 ServerSession 安装到 libca HttpServer 的 Streamable HTTP adapter。
-/// @details 支持 buffered 或 SSE POST response、Last-Event-ID 重放、DELETE session、Origin
-/// 与可选 authorization；不提供独立 GET stream 或 server-initiated request。不同 HTTP 连接可
-/// 并发处理，不同 session 相互独立，同一 session 内的消息按 handler 获得锁的顺序串行执行。
+/// @brief 将独立或共享 ServerSession 安装到 libca HttpServer 的 Streamable HTTP adapter。
+/// @details dual-era 双模路由：带 `MCP-Session-Id` 的 POST/GET/DELETE 走 legacy 会话路径
+/// （session 查找、同一 session 串行、SSE 重放、DELETE 终止）；无 session id 的 POST 中
+/// `initialize` 仍创建 legacy session（老客户端入口），其余请求（含 server/discover）走
+/// modern 无状态路径，交给 `shared_server` 处理。modern 路径不创建 session、不计入 session
+/// 总数上限，且始终返回 buffered `application/json`、不返回 `MCP-Session-Id`。支持 buffered
+/// 或 SSE POST response、Last-Event-ID 重放、DELETE session、Origin 与可选 authorization；
+/// 不提供独立 GET stream 或 server-initiated request。不同 HTTP 连接可并发处理，不同 session
+/// 相互独立，同一 session 内的消息按 handler 获得锁的顺序串行执行。
 class StreamableHttpServer
 {
 public:
@@ -107,6 +117,8 @@ public:
     ~StreamableHttpServer()                                          = default;
 
     /// @brief 校验配置并创建尚未安装 route 的 adapter。
+    /// @note session factory 与 `options.shared_server` 至少提供一个，两者可同时存在
+    /// （dual-era）。
     static McpResult<StreamableHttpServer> create(
         HttpSessionFactory          factory,
         StreamableHttpServerOptions options = StreamableHttpServerOptions());

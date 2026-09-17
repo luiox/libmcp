@@ -18,12 +18,19 @@
 #include <libca/net/address.hpp>
 
 #include "mcp/streamable_http_server.hpp"
+#include "mcp/tool_registry.hpp"
 
 namespace mcp::test {
 namespace {
 
 constexpr std::string_view INITIALIZE =
     R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"http-test","version":"1"}}})";
+
+constexpr std::string_view MODERN_TOOLS_LIST =
+    R"({"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}})";
+
+constexpr std::string_view MISMATCHED_META_TOOLS_LIST =
+    R"({"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}})";
 
 class ServerRunner
 {
@@ -121,6 +128,44 @@ McpResult<ServerSession> make_session()
 HttpSessionFactory make_session_factory()
 {
     return [](const HttpSessionContext&) { return make_session(); };
+}
+
+/// @brief 创建 modern 无状态路径使用的共享实例：安装一个 echo 工具以支撑 tools/list。
+std::shared_ptr<ServerSession> make_shared_server()
+{
+    auto created = make_session();
+    EXPECT_TRUE(created.is_ok()) << (created.is_err() ? created.unwrap_err().to_string() : "");
+    if (created.is_err()) return nullptr;
+    auto session = std::move(created).unwrap();
+
+    auto registry = std::make_shared<ToolRegistry>();
+    auto tool     = ToolDefinition::parse(ca::str::Utf8StringRef::from_cstr(
+        R"({"name":"echo","description":"Echo text","inputSchema":{"type":"object"}})"));
+    EXPECT_TRUE(tool.is_ok());
+    if (tool.is_err()) return nullptr;
+    auto registered = registry->register_tool(
+        std::move(tool).unwrap(),
+        [](const ca::json::JsonValue&) -> MethodResult {
+            ca::json::JsonDocument document;
+            auto content_item = ca::json::JsonValue::make_object();
+            content_item.set(document.arena().intern("type"),
+                             ca::json::JsonValue::make_string(document.arena().intern("text")));
+            content_item.set(document.arena().intern("text"),
+                             ca::json::JsonValue::make_string(document.arena().intern("hello")));
+            auto content = ca::json::JsonValue::make_array();
+            content.append(std::move(content_item));
+            auto result = ca::json::JsonValue::make_object();
+            result.set(document.arena().intern("content"), std::move(content));
+            result.set(document.arena().intern("isError"), ca::json::JsonValue::make_bool(false));
+            document.root() = std::move(result);
+            return ca::core::Ok(std::move(document));
+        });
+    EXPECT_TRUE(registered.is_ok());
+    if (registered.is_err()) return nullptr;
+    auto installed = session.install_tools(registry);
+    EXPECT_TRUE(installed.is_ok());
+    if (installed.is_err()) return nullptr;
+    return std::make_shared<ServerSession>(std::move(session));
 }
 
 ca::core::Bytes body_bytes(std::string_view body)
@@ -918,6 +963,123 @@ TEST(StreamableHttpServerTest, ValidatesAdapterOptions)
     duplicate_origins.allowed_origins = {"https://example.com", "https://example.com"};
     EXPECT_TRUE(StreamableHttpServer::create(make_session_factory(), std::move(duplicate_origins))
                     .is_err());
+}
+
+TEST(StreamableHttpServerTest, ModernPostWithoutSession)
+{
+    StreamableHttpServerOptions options;
+    options.shared_server = make_shared_server();
+    auto server           = TestServer::start(HttpSessionFactory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto response = send(client, server->url(), post_request(MODERN_TOOLS_LIST));
+    ASSERT_EQ(response.status, 200);
+    EXPECT_EQ(response.headers.get("Content-Type"), "application/json");
+    EXPECT_FALSE(response.headers.contains("MCP-Session-Id"));
+    EXPECT_NE(body_text(response.body).find("resultType"), std::string::npos);
+    EXPECT_EQ(server->session_count(), 0U);
+
+    auto notified = send(
+        client,
+        server->url(),
+        post_request(
+            R"({"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}})"));
+    EXPECT_EQ(notified.status, 202);
+    EXPECT_EQ(server->session_count(), 0U);
+}
+
+TEST(StreamableHttpServerTest, DiscoverPostWithoutSession)
+{
+    StreamableHttpServerOptions options;
+    options.shared_server = make_shared_server();
+    auto server           = TestServer::start(HttpSessionFactory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto response = send(client,
+                         server->url(),
+                         post_request(R"({"jsonrpc":"2.0","id":3,"method":"server/discover"})"));
+    ASSERT_EQ(response.status, 200);
+    EXPECT_FALSE(response.headers.contains("MCP-Session-Id"));
+    EXPECT_NE(body_text(response.body).find("supportedVersions"), std::string::npos);
+
+    auto parsed = JsonRpcMessage::parse(
+        ca::str::Utf8StringRef::from_string_view(body_text(response.body)));
+    ASSERT_TRUE(parsed.is_ok());
+    EXPECT_NE(std::move(parsed).unwrap().result(), nullptr);
+}
+
+TEST(StreamableHttpServerTest, InitializeStillCreatesSession)
+{
+    auto server = TestServer::start(make_session_factory());
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto initialized = send(client, server->url(), post_request(INITIALIZE));
+    ASSERT_EQ(initialized.status, 200);
+    EXPECT_EQ(initialized.headers.get("Content-Type"), "application/json");
+    const auto session_id = required_session_id(initialized);
+    EXPECT_EQ(session_id.size(), 64U);
+    EXPECT_EQ(server->session_count(), 1U);
+}
+
+TEST(StreamableHttpServerTest, HeaderMetaMismatch)
+{
+    StreamableHttpServerOptions options;
+    options.shared_server = make_shared_server();
+    auto server           = TestServer::start(HttpSessionFactory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto response = send(client,
+                         server->url(),
+                         post_request(MISMATCHED_META_TOOLS_LIST, std::nullopt, "2026-07-28"));
+    EXPECT_EQ(json_rpc_error_code(response), -32020);
+    EXPECT_FALSE(response.headers.contains("MCP-Session-Id"));
+    EXPECT_EQ(server->session_count(), 0U);
+}
+
+TEST(StreamableHttpServerTest, HeaderOnlyVersionAccepted)
+{
+    StreamableHttpServerOptions options;
+    options.shared_server = make_shared_server();
+    auto server           = TestServer::start(HttpSessionFactory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto response = send(client,
+                         server->url(),
+                         post_request(R"({"jsonrpc":"2.0","id":4,"method":"ping"})",
+                                      std::nullopt,
+                                      "2026-07-28"));
+    ASSERT_EQ(response.status, 200);
+    EXPECT_EQ(response.headers.get("Content-Type"), "application/json");
+    auto parsed = JsonRpcMessage::parse(
+        ca::str::Utf8StringRef::from_string_view(body_text(response.body)));
+    ASSERT_TRUE(parsed.is_ok());
+    EXPECT_NE(std::move(parsed).unwrap().result(), nullptr);
+}
+
+TEST(StreamableHttpServerTest, ModernRequestNotCountedAgainstSessionCap)
+{
+    StreamableHttpServerOptions options;
+    options.max_sessions   = 1;
+    options.shared_server  = make_shared_server();
+    auto server            = TestServer::start(make_session_factory(), std::move(options));
+    ASSERT_NE(server, nullptr);
+    auto client = make_client();
+
+    auto first = send(client, server->url(), post_request(MODERN_TOOLS_LIST));
+    EXPECT_EQ(first.status, 200);
+    auto second = send(client, server->url(), post_request(MODERN_TOOLS_LIST));
+    EXPECT_EQ(second.status, 200);
+    EXPECT_EQ(server->session_count(), 0U);
+
+    auto initialized = send(client, server->url(), post_request(INITIALIZE));
+    EXPECT_EQ(initialized.status, 200);
+    EXPECT_FALSE(required_session_id(initialized).empty());
+    EXPECT_EQ(server->session_count(), 1U);
 }
 
 }   // namespace
